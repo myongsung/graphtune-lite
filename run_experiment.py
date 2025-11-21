@@ -10,6 +10,7 @@ from graphtune.train import train_one_stage
 from graphtune.efficiency import profile_model_static, estimate_flops
 from graphtune.suep import compute_suep
 from graphtune.leaderboard import print_leaderboard
+from graphtune.budget import make_budgeted_train_loader, LossGradientBudgetScheduler
 
 
 def parse_list(arg, cast_fn=str):
@@ -17,16 +18,9 @@ def parse_list(arg, cast_fn=str):
 
 
 def compute_graph_difficulty(A_np: np.ndarray, num_nodes: int) -> float:
-    """
-    Simple, robust difficulty proxy:
-      difficulty = N * log(1 + avg_degree)
-
-    - N↑, degree↑일수록 그래프/도시 구조가 복잡 → 전이 난도↑
-    """
     A_bin = (A_np > 0).astype(np.float32)
     avg_deg = float(A_bin.sum(axis=1).mean())
-    diff = float(num_nodes * np.log1p(avg_deg))
-    return diff
+    return float(num_nodes * np.log1p(avg_deg))
 
 
 def main():
@@ -36,7 +30,7 @@ def main():
     p.add_argument("--datasets", type=str, required=True,
                    help="comma-separated order, e.g. metr-la,pems-bay")
     p.add_argument("--epochs", type=str, default="50",
-                   help="comma-separated per stage, e.g. 50,30")
+                   help="comma-separated max epochs per stage, e.g. 50,30")
     p.add_argument("--lrs", type=str, default="0.001",
                    help="comma-separated per stage, e.g. 1e-3,5e-4")
     p.add_argument("--batch_size", type=int, default=128)
@@ -50,6 +44,18 @@ def main():
     p.add_argument("--adj_urls", type=str, default=None)
     p.add_argument("--loc_urls", type=str, default=None)
 
+    # ----- Few-shot / budget curve -----
+    p.add_argument("--fractions", type=str, default="0.1,0.3,1.0",
+                   help="budget fractions for transfer curve, e.g. 0.05,0.1,0.2,0.5,1.0")
+    p.add_argument("--fewshot_mode", type=str, default="subset",
+                   choices=["subset","steps","both"],
+                   help="how to enforce low-budget training")
+
+    # ----- Loss-Gradient scheduler -----
+    p.add_argument("--min_gain_rate", type=float, default=0.02)
+    p.add_argument("--min_rel_improve", type=float, default=0.005)
+    p.add_argument("--patience", type=int, default=1)
+
     # ----- S_uep weights -----
     p.add_argument("--w_perf", type=float, default=0.45)
     p.add_argument("--w_transfer_auc", type=float, default=0.35)
@@ -58,14 +64,10 @@ def main():
     p.add_argument("--difficulty_alpha", type=float, default=1.0)
 
     # ----- budgets (optional) -----
-    p.add_argument("--budget_mem_mb", type=float, default=None,
-                   help="GPU peak memory budget (MB). None => normalize by max stage.")
-    p.add_argument("--budget_time_sec", type=float, default=None,
-                   help="Train wall-time budget (sec). None => normalize by max stage.")
-    p.add_argument("--budget_flops_g", type=float, default=None,
-                   help="Forward FLOPs budget per step (GFLOPs). None => normalize by max stage.")
-    p.add_argument("--budget_trainable_m", type=float, default=None,
-                   help="Trainable params budget (Millions). None => normalize by max stage.")
+    p.add_argument("--budget_mem_mb", type=float, default=None)
+    p.add_argument("--budget_time_sec", type=float, default=None)
+    p.add_argument("--budget_flops_g", type=float, default=None)
+    p.add_argument("--budget_trainable_m", type=float, default=None)
 
     # output
     p.add_argument("--out_json", type=str, default="results.json")
@@ -87,6 +89,14 @@ def main():
     h5_urls = parse_list(args.h5_urls, str) if args.h5_urls else [None] * len(dataset_list)
     adj_urls = parse_list(args.adj_urls, str) if args.adj_urls else [None] * len(dataset_list)
     loc_urls = parse_list(args.loc_urls, str) if args.loc_urls else [None] * len(dataset_list)
+
+    fractions = parse_list(args.fractions, float)
+    scheduler_tpl = LossGradientBudgetScheduler(
+        fractions=fractions,
+        min_gain_rate=args.min_gain_rate,
+        min_rel_improve=args.min_rel_improve,
+        patience=args.patience,
+    )
 
     budgets = None
     if any(v is not None for v in [args.budget_mem_mb, args.budget_time_sec, args.budget_flops_g, args.budget_trainable_m]):
@@ -133,17 +143,8 @@ def main():
                 exclude = ("W_fwd", "W_bwd")
             elif model_name in ["dgcrn"]:
                 exclude = ("W_fwd_fix", "W_bwd_fix")
-
             reused = load_partial_state(model, prev_state, exclude_prefixes=exclude)
             print(f"  loaded partial state: copied {reused} tensors")
-
-        # ----- zero-shot before finetune -----
-        zero_mae = zero_rmse = None
-        if stage_idx > 0:
-            zero_mae, zero_rmse = evaluate_model(
-                model, bundle["test_loader"], bundle["scaler"], device=device
-            )
-            print(f"  [Zero-shot] MAE={zero_mae:.4f} RMSE={zero_rmse:.4f}")
 
         # ----- static efficiency -----
         static_eff = profile_model_static(model)
@@ -152,7 +153,7 @@ def main():
               f"size={static_eff['param_size_mb']:.2f}MB "
               f"trainable_ratio={static_eff['trainable_ratio']:.3f}")
 
-        # ----- FLOPs estimate (optional) -----
+        # ----- flops -----
         flops_info = None
         try:
             first_batch = next(iter(bundle["train_loader"]))
@@ -162,43 +163,125 @@ def main():
                 print(f"  [FLOPs] flops={flops_info['flops']/1e9:.2f}G "
                       f"macs={flops_info['macs']/1e9:.2f}G")
             else:
-                print("  [FLOPs] thop not installed. (pip install thop to enable)")
+                print("  [FLOPs] thop not installed. (pip install thop)")
         except Exception as e:
-            print(f"  [FLOPs] failed to estimate: {e}")
-
-        # ----- finetune/train -----
-        model, dyn_eff = train_one_stage(
-            model,
-            bundle["train_loader"],
-            bundle["val_loader"],
-            bundle["scaler"],
-            num_epochs=epochs_list[stage_idx],
-            lr=lrs_list[stage_idx],
-            device=device,
-            name=f"{model_name}-{dname}",
-            is_dcrnn=(model_name == "dcrnn"),
-            profile=True
-        )
-        print(f"  [DynEff] time={dyn_eff['train_time_sec']:.1f}s "
-              f"peak_mem={dyn_eff['peak_mem_mb']:.1f}MB")
-
-        # ----- accuracy after finetune -----
-        test_mae, test_rmse = evaluate_model(
-            model, bundle["test_loader"], bundle["scaler"], device=device
-        )
-        print(f"  [Test] MAE={test_mae:.4f} RMSE={test_rmse:.4f}")
-
-        # ----- transfer curve points -----
-        # 지금은 2점(0-shot, finetune) curve를 기본으로 기록.
-        curve_rmse = []
-        if zero_rmse is not None:
-            curve_rmse.append((0.0, float(zero_rmse)))
-        curve_rmse.append((1.0, float(test_rmse)))
+            print(f"  [FLOPs] failed: {e}")
 
         # ----- graph difficulty -----
         difficulty = compute_graph_difficulty(bundle["A"], bundle["num_nodes"])
         print(f"  [Difficulty] {difficulty:.2f}")
 
+        # ============================
+        # Stage 0: full pretrain
+        # ============================
+        if stage_idx == 0:
+            model, dyn_eff = train_one_stage(
+                model,
+                bundle["train_loader"],
+                bundle["val_loader"],
+                bundle["scaler"],
+                num_epochs=epochs_list[stage_idx],
+                lr=lrs_list[stage_idx],
+                device=device,
+                name=f"{model_name}-{bundle['dataset_name']}",
+                is_dcrnn=(model_name == "dcrnn"),
+                profile=True
+            )
+            test_mae, test_rmse = evaluate_model(
+                model, bundle["test_loader"], bundle["scaler"], device=device
+            )
+            curve_rmse = [(1.0, float(test_rmse))]
+            zero_mae = zero_rmse = None
+
+        # ============================
+        # Stage 1+: zero-shot → auto curve → budgeted fine-tune
+        # ============================
+        else:
+            # zero-shot on val + test
+            zero_val_mae, zero_val_rmse = evaluate_model(
+                model, bundle["val_loader"], bundle["scaler"], device=device
+            )
+            zero_mae, zero_rmse = evaluate_model(
+                model, bundle["test_loader"], bundle["scaler"], device=device
+            )
+            print(f"  [Zero-shot] val_RMSE={zero_val_rmse:.4f} test_RMSE={zero_rmse:.4f}")
+
+            curve_rmse = [(0.0, float(zero_rmse))]
+
+            scheduler = LossGradientBudgetScheduler(
+                fractions=scheduler_tpl.planned_fractions(),
+                min_gain_rate=args.min_gain_rate,
+                min_rel_improve=args.min_rel_improve,
+                patience=args.patience,
+            )
+
+            spent_frac = 0.0
+            prev_val_rmse = float(zero_val_rmse)
+
+            # aggregate dynamic efficiency for the whole tuning stage
+            total_time = 0.0
+            peak_mem = 0.0
+            total_epochs = 0
+
+            for target_frac in scheduler.planned_fractions():
+                if target_frac <= spent_frac:
+                    continue
+
+                delta_frac = target_frac - spent_frac
+                delta_epochs = max(1, int(round(epochs_list[stage_idx] * delta_frac)))
+                total_epochs += delta_epochs
+
+                # budgeted loader + steps cap
+                ft_loader, max_batches = make_budgeted_train_loader(
+                    bundle["train_loader"], target_frac,
+                    mode=args.fewshot_mode,
+                    seed=42 + stage_idx
+                )
+
+                model, dyn_eff_delta = train_one_stage(
+                    model,
+                    ft_loader,
+                    bundle["val_loader"],
+                    bundle["scaler"],
+                    num_epochs=delta_epochs,
+                    lr=lrs_list[stage_idx],
+                    device=device,
+                    name=f"{model_name}-{bundle['dataset_name']}-frac{target_frac:.2f}",
+                    is_dcrnn=(model_name == "dcrnn"),
+                    profile=True,
+                    max_batches_per_epoch=max_batches
+                )
+
+                total_time += dyn_eff_delta.get("train_time_sec", 0.0)
+                peak_mem = max(peak_mem, dyn_eff_delta.get("peak_mem_mb", 0.0))
+
+                # evaluate after this mini-budget
+                val_mae, val_rmse = evaluate_model(
+                    model, bundle["val_loader"], bundle["scaler"], device=device
+                )
+                test_mae, test_rmse = evaluate_model(
+                    model, bundle["test_loader"], bundle["scaler"], device=device
+                )
+
+                spent_frac = target_frac
+                curve_rmse.append((spent_frac, float(test_rmse)))
+
+                print(f"  [Budget {spent_frac:.2f}] val_RMSE={val_rmse:.4f} test_RMSE={test_rmse:.4f}")
+
+                if not scheduler.should_continue(prev_val_rmse, float(val_rmse), delta_frac):
+                    print("  [Scheduler] marginal gain too small → early stop.")
+                    break
+
+                prev_val_rmse = float(val_rmse)
+
+            dyn_eff = {
+                "train_time_sec": float(total_time),
+                "peak_mem_mb": float(peak_mem),
+                "epochs": int(total_epochs),
+                "lr": float(lrs_list[stage_idx]),
+            }
+
+        # ----- stage result -----
         stage_result = {
             "stage": stage_idx,
             "dataset": bundle["dataset_name"],
@@ -216,7 +299,7 @@ def main():
         }
         all_stage_results.append(stage_result)
 
-        # ----- running S_uep + real-time leaderboard -----
+        # ----- running S_uep + realtime leaderboard -----
         suep_summary = compute_suep(
             all_stage_results,
             w_perf=args.w_perf,
@@ -227,7 +310,6 @@ def main():
             budgets=budgets,
         )
 
-        # push per-stage breakdown back for printing
         per_stage_map = {ps["stage"]: ps for ps in suep_summary["per_stage"]}
         for sr in all_stage_results:
             ps = per_stage_map[sr["stage"]]
