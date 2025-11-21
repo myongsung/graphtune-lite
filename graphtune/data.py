@@ -22,7 +22,6 @@ WEEK_NUM = 7
 # ---------------------------------------------------------------------
 DATA_SOURCES = {
     "metr-la": {
-        # HF repo contains: metr-la.h5, adj_mx.pkl
         "hf_repo": "jimmygao3218/METRLA",
         "files": {
             "h5": "metr-la.h5",
@@ -30,13 +29,11 @@ DATA_SOURCES = {
             "loc": "graph_sensor_locations.csv",
         },
         "urls": {
-            # loc csv is tiny, fetch from DCRNN raw
             "graph_sensor_locations.csv":
                 "https://raw.githubusercontent.com/liyaguang/DCRNN/master/data/sensor_graph/graph_sensor_locations.csv",
         }
     },
     "pems-bay": {
-        # Zenodo direct download for h5/adj
         "hf_repo": None,
         "files": {
             "h5": "pems-bay.h5",
@@ -77,18 +74,14 @@ def _ensure_local_file(dataset_key, kind, data_dir, source="auto",
     filename = ds["files"][kind]
     local_path = os.path.join(data_dir, filename)
 
-    # local already exists
     if os.path.exists(local_path) and source in ["auto", "local"]:
         return local_path
 
-    # choose auto route
     if source == "auto":
-        # 1) url if present
         url = url_override or ds["urls"].get(filename)
         if url:
             return _download_url(url, local_path)
 
-        # 2) hf if repo present
         if ds.get("hf_repo"):
             return hf_hub_download(
                 repo_id=ds["hf_repo"],
@@ -98,7 +91,6 @@ def _ensure_local_file(dataset_key, kind, data_dir, source="auto",
                 revision=revision,
             )
 
-        # 3) fallback to local (but file missing)
         raise FileNotFoundError(
             f"{local_path} not found and no auto source for {dataset_key}:{filename}"
         )
@@ -129,7 +121,6 @@ def _ensure_local_file(dataset_key, kind, data_dir, source="auto",
 
 
 class SequenceDatasetWithMask(Dataset):
-    """Baseline/HyperNet/DCRNN/DGCRN용: x=[T_in,N]"""
     def __init__(self, X_norm, Y_norm, mask):
         self.X = torch.from_numpy(X_norm).float()
         self.Y = torch.from_numpy(Y_norm).float()
@@ -143,7 +134,6 @@ class SequenceDatasetWithMask(Dataset):
 
 
 class BigSTDataset(Dataset):
-    """BigST용: x=[N,T_in,3] (speed,tod,week)"""
     def __init__(self, X_norm, Y_norm, mask, start_idx,
                  time_in_day, week_id, T_in, num_nodes):
         self.X = X_norm
@@ -182,35 +172,24 @@ class BigSTDataset(Dataset):
 
 
 def _infer_loc_columns(loc_df: pd.DataFrame):
-    """
-    위치 CSV의 컬럼명이 제각각일 수 있어서
-    sensor_id / lat / lon 컬럼을 최대한 robust하게 추론.
-    """
-    # 컬럼 이름 정규화
     norm_map = {str(c).lower().strip(): c for c in loc_df.columns}
 
-    # id 컬럼 후보
     id_candidates = ["sensor_id", "sensorid", "id", "station_id", "node_id"]
     lat_candidates = ["latitude", "lat", "y"]
     lon_candidates = ["longitude", "lon", "lng", "long", "x"]
 
-    id_col = None
-    lat_col = None
-    lon_col = None
+    id_col = lat_col = lon_col = None
 
     for k in id_candidates:
         if k in norm_map:
             id_col = norm_map[k]; break
-
     for k in lat_candidates:
         if k in norm_map:
             lat_col = norm_map[k]; break
-
     for k in lon_candidates:
         if k in norm_map:
             lon_col = norm_map[k]; break
 
-    # 헤더가 없거나 예상 못한 이름이면 first 3 columns fallback
     if id_col is None or lat_col is None or lon_col is None:
         if loc_df.shape[1] >= 3:
             cols = list(loc_df.columns[:3])
@@ -227,40 +206,74 @@ def _infer_loc_columns(loc_df: pd.DataFrame):
 
 def load_adj_and_coords(adj_path, loc_path):
     """
-    adj_pkl: (sensor_ids, sensor_id_to_ind, adj_mx)
-    loc_csv: 다양한 헤더 가능. id/lat/lon을 자동 추론.
-    coords는 sensor_ids 순서에 align.
+    Robust sensor-id ↔ location alignment.
+    1) ID 기반 매칭 시도
+    2) 일부 누락이면:
+       - loc 행 수 == sensor_ids 수: 같은 순서로 정렬된 파일로 간주하고 순서 매칭
+       - 아니면 누락 센서는 (0,0)으로 채우고 경고만 출력
     """
     with open(adj_path, "rb") as f:
         sensor_ids, sensor_id_to_ind, adj_mx = pickle.load(f, encoding="latin1")
     A = adj_mx.astype(np.float32)
 
-    # 일단 일반 read
+    # normalize sensor ids to int list
+    sensor_ids_int = []
+    for sid in sensor_ids:
+        try:
+            sensor_ids_int.append(int(sid))
+        except Exception:
+            # 혹시 문자열/바이트/특수형태면 숫자만 추출 시도
+            s = str(sid)
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if digits == "":
+                raise ValueError(f"Cannot parse sensor id: {sid}")
+            sensor_ids_int.append(int(digits))
+
     loc_df = pd.read_csv(loc_path)
 
-    # 혹시 헤더가 없어서 컬럼이 숫자로 들어온 경우(0,1,2...)도 처리
+    # header 없는 경우 재시도
     if loc_df.columns.dtype == "int64" or all(str(c).isdigit() for c in loc_df.columns):
-        # header=None로 다시 읽기 시도
         loc_df = pd.read_csv(loc_path, header=None)
 
     id_col, lat_col, lon_col = _infer_loc_columns(loc_df)
 
-    # 타입 캐스팅
-    loc_df[id_col] = loc_df[id_col].astype(int)
-    loc_df[lat_col] = loc_df[lat_col].astype(float)
-    loc_df[lon_col] = loc_df[lon_col].astype(float)
+    loc_df[id_col] = loc_df[id_col].astype(int, errors="ignore")
+    loc_df[lat_col] = loc_df[lat_col].astype(float, errors="ignore")
+    loc_df[lon_col] = loc_df[lon_col].astype(float, errors="ignore")
 
-    id2coord = {
-        int(row[id_col]): [float(row[lat_col]), float(row[lon_col])]
-        for _, row in loc_df.iterrows()
-    }
+    id2coord = {}
+    for _, row in loc_df.iterrows():
+        try:
+            rid = int(row[id_col])
+        except Exception:
+            continue
+        id2coord[rid] = [float(row[lat_col]), float(row[lon_col])]
 
     coords_list = []
-    for sid in sensor_ids:
-        sid_int = int(sid)
-        if sid_int not in id2coord:
-            raise ValueError(f"sensor_id {sid_int} missing in {loc_path}")
-        coords_list.append(id2coord[sid_int])
+    missing_ids = []
+    for sid_int in sensor_ids_int:
+        if sid_int in id2coord:
+            coords_list.append(id2coord[sid_int])
+        else:
+            missing_ids.append(sid_int)
+            coords_list.append(None)
+
+    # ---- fallback 1: same-order alignment
+    if len(missing_ids) > 0:
+        if len(loc_df) == len(sensor_ids_int):
+            print(f"[warn] {len(missing_ids)} sensor_ids missing in {loc_path}. "
+                  f"Assuming loc file is already aligned by order.")
+            coords_list = loc_df[[lat_col, lon_col]].to_numpy(dtype=np.float32).tolist()
+            coords = np.array(coords_list, dtype=np.float32)
+            return A, coords, sensor_ids
+
+        # ---- fallback 2: fill missing with zeros
+        print(f"[warn] {len(missing_ids)} sensor_ids missing in {loc_path}. "
+              f"Filling missing coords with (0,0). Example missing: {missing_ids[:5]}")
+        for i, c in enumerate(coords_list):
+            if c is None:
+                coords_list[i] = [0.0, 0.0]
+
     coords = np.array(coords_list, dtype=np.float32)
     return A, coords, sensor_ids
 
@@ -274,14 +287,11 @@ def prepare_dataset(
     batch_size=128,
     num_workers=2,
     for_bigst=False,
-    source="auto",        # default auto-download
+    source="auto",
     cache_dir=None,
-    url_overrides=None,   # dict {"h5": "...", "adj": "...", "loc": "..."}
+    url_overrides=None,
     revision=None,
 ):
-    """
-    return dict with loaders, scaler, A/coords, meta
-    """
     dataset_name = dataset_name.lower()
     if dataset_name in ["metr-la", "metr", "la"]:
         ds_key = "metr-la"
