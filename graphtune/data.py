@@ -128,10 +128,6 @@ def _ensure_local_file(dataset_key, kind, data_dir, source="auto",
     raise ValueError(f"Unknown source={source}")
 
 
-STEPS_PER_DAY = 288
-WEEK_NUM = 7
-
-
 class SequenceDatasetWithMask(Dataset):
     """Baseline/HyperNet/DCRNN/DGCRN용: x=[T_in,N]"""
     def __init__(self, X_norm, Y_norm, mask):
@@ -185,22 +181,78 @@ class BigSTDataset(Dataset):
         )
 
 
+def _infer_loc_columns(loc_df: pd.DataFrame):
+    """
+    위치 CSV의 컬럼명이 제각각일 수 있어서
+    sensor_id / lat / lon 컬럼을 최대한 robust하게 추론.
+    """
+    # 컬럼 이름 정규화
+    norm_map = {str(c).lower().strip(): c for c in loc_df.columns}
+
+    # id 컬럼 후보
+    id_candidates = ["sensor_id", "sensorid", "id", "station_id", "node_id"]
+    lat_candidates = ["latitude", "lat", "y"]
+    lon_candidates = ["longitude", "lon", "lng", "long", "x"]
+
+    id_col = None
+    lat_col = None
+    lon_col = None
+
+    for k in id_candidates:
+        if k in norm_map:
+            id_col = norm_map[k]; break
+
+    for k in lat_candidates:
+        if k in norm_map:
+            lat_col = norm_map[k]; break
+
+    for k in lon_candidates:
+        if k in norm_map:
+            lon_col = norm_map[k]; break
+
+    # 헤더가 없거나 예상 못한 이름이면 first 3 columns fallback
+    if id_col is None or lat_col is None or lon_col is None:
+        if loc_df.shape[1] >= 3:
+            cols = list(loc_df.columns[:3])
+            id_col = id_col or cols[0]
+            lat_col = lat_col or cols[1]
+            lon_col = lon_col or cols[2]
+        else:
+            raise ValueError(
+                f"Location file has <3 columns and cannot infer id/lat/lon: {loc_df.columns}"
+            )
+
+    return id_col, lat_col, lon_col
+
+
 def load_adj_and_coords(adj_path, loc_path):
     """
     adj_pkl: (sensor_ids, sensor_id_to_ind, adj_mx)
-    loc_csv: sensor_id, latitude, longitude
+    loc_csv: 다양한 헤더 가능. id/lat/lon을 자동 추론.
     coords는 sensor_ids 순서에 align.
     """
     with open(adj_path, "rb") as f:
         sensor_ids, sensor_id_to_ind, adj_mx = pickle.load(f, encoding="latin1")
     A = adj_mx.astype(np.float32)
 
+    # 일단 일반 read
     loc_df = pd.read_csv(loc_path)
-    loc_df["sensor_id"] = loc_df["sensor_id"].astype(int)
+
+    # 혹시 헤더가 없어서 컬럼이 숫자로 들어온 경우(0,1,2...)도 처리
+    if loc_df.columns.dtype == "int64" or all(str(c).isdigit() for c in loc_df.columns):
+        # header=None로 다시 읽기 시도
+        loc_df = pd.read_csv(loc_path, header=None)
+
+    id_col, lat_col, lon_col = _infer_loc_columns(loc_df)
+
+    # 타입 캐스팅
+    loc_df[id_col] = loc_df[id_col].astype(int)
+    loc_df[lat_col] = loc_df[lat_col].astype(float)
+    loc_df[lon_col] = loc_df[lon_col].astype(float)
 
     id2coord = {
-        int(r.sensor_id): [float(r.latitude), float(r.longitude)]
-        for r in loc_df.itertuples()
+        int(row[id_col]): [float(row[lat_col]), float(row[lon_col])]
+        for _, row in loc_df.iterrows()
     }
 
     coords_list = []
