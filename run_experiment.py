@@ -3,16 +3,21 @@ import json
 import numpy as np
 import torch
 
-from graphtune import prepare_dataset, build_model, load_partial_state
-from graphtune.config import DEFAULT_MODEL_KWARGS
-from graphtune.train import train_one_stage
-from graphtune.suep import compute_suep
-from graphtune.leaderboard import print_leaderboard
+# 최상위 API (v2 facade)
+from graphtune import prepare_dataset, build_model, load_partial_state, train_one_stage
+
+# 아직 legacy에 남아있는 것들은 legacy에서 직접 import
+from graphtune.legacy.config import DEFAULT_MODEL_KWARGS
+from graphtune.legacy.suep import compute_suep
+from graphtune.legacy.leaderboard import print_leaderboard
+
+# v2 wrapper/서브패키지들
 from graphtune.budget import make_budgeted_train_loader, LossGradientBudgetScheduler
 from graphtune.efficiency.static import profile_model_static
 from graphtune.efficiency.flops import estimate_flops
 from graphtune.efficiency.profiler import StageProfiler
 from graphtune.eval.evaluator import evaluate_model
+
 
 
 def parse_list(arg, cast_fn=str):
