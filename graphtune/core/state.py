@@ -1,2 +1,6 @@
-"""State / checkpoint utilities (v1-compatible)."""
-from ..legacy.utils import load_partial_state  # noqa: F401
+# graphtune/core/state.py
+"""State / checkpoint utilities (v2)."""
+
+from ..utils import load_partial_state  # noqa: F401
+
+__all__ = ["load_partial_state"]

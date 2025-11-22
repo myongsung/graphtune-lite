@@ -1,3 +1,4 @@
+# graphtune/core/scoring.py
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
@@ -14,13 +15,12 @@ def _get_transfer_curve(sr: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
     Returns:
       frac (budget fraction in [0,1]),
       rmse values at those fractions.
-
-    Expected optional field:
+      
+    Expected formats:
       sr["curve_rmse"] = [(frac, rmse), ...]
-    Else fallback to:
-      zero_rmse -> test_rmse with fractions [0,1]
+      OR fallback from zero_rmse/test_rmse.
     """
-    if "curve_rmse" in sr and sr["curve_rmse"]:
+    if "curve_rmse" in sr and sr["curve_rmse"] is not None:
         pts = sr["curve_rmse"]
         pts = sorted(pts, key=lambda p: p[0])
         frac = np.array([p[0] for p in pts], dtype=np.float64)
@@ -45,14 +45,20 @@ def compute_suep(
     w_budget: float = 0.25,
     # difficulty weighting hyperparam
     difficulty_alpha: float = 1.0,
-    # budgets (None이면 stage 내부 max로 normalize)
+    # explicit resource budgets (optional)
     budgets: Optional[Dict[str, float]] = None,
-    eps: float = 1e-9
+    eps: float = 1e-9,
 ) -> Dict[str, Any]:
     """
-    Detailed Unified Efficiency–Elasticity score S_uep (GraphTune).
+    Compute S_uep score across stages.
 
-    Components per stage i:
+    StageScore_i =
+        w_perf * PerfNorm_i
+      + w_transfer_auc * TransferAUC_i
+      + w_eff * EffNorm_i
+      - w_budget * BudgetPenalty_i
+
+    where:
       PerfNorm_i:
          = best_rmse / ft_rmse_i     (0..1+, higher better)
 
@@ -69,59 +75,68 @@ def compute_suep(
          only if budgets provided:
          penalty = mean(max(0, usage - 1))
 
-      StageScore_i:
-         = w_perf*PerfNorm_i
-           + w_transfer_auc*TransferAUC_i
-           + w_eff*EffNorm_i
-           - w_budget*BudgetPenalty_i
-
-    Difficulty weights:
-      weight_i ∝ difficulty_i^alpha
-      S_uep = Σ weight_i * StageScore_i
+    Final:
+      S_uep = Σ difficulty_weight_i * StageScore_i
+      difficulty_weight_i ∝ (difficulty_i)^difficulty_alpha
     """
     if len(stage_results) == 0:
-        return {"S_uep": 0.0, "per_stage": [], "weights": {}}
-
-    ft_rmses = np.array([sr["test_rmse"] for sr in stage_results], dtype=np.float64)
+        return {
+            "S_uep": 0.0,
+            "weights": {
+                "w_perf": w_perf,
+                "w_transfer_auc": w_transfer_auc,
+                "w_eff": w_eff,
+                "w_budget": w_budget,
+                "difficulty_alpha": difficulty_alpha,
+            },
+            "per_stage": [],
+        }
 
     # ---------- PerfNorm ----------
-    rmse_ref = ft_rmses.min() if len(ft_rmses) else 1.0
-    perf_norm = rmse_ref / (ft_rmses + eps)
+    ft_rmse = np.array([sr.get("test_rmse", 1.0) for sr in stage_results], dtype=np.float64)
+    ft_rmse = np.maximum(ft_rmse, eps)
+    best_rmse = float(np.min(ft_rmse))
+    perf_norm = best_rmse / ft_rmse
 
-    # ---------- Transfer AUC ----------
-    transfer_auc = []
-    for sr in stage_results:
-        frac, rmse_curve = _get_transfer_curve(sr)
-        z = sr.get("zero_rmse", None)
-        if z is None or z <= 0:
-            # Stage0 or missing zero-shot => no transfer credit
-            transfer_auc.append(0.0)
+    # ---------- TransferAUC ----------
+    transfer_auc = np.zeros(len(stage_results), dtype=np.float64)
+    for i, sr in enumerate(stage_results):
+        zero = sr.get("zero_rmse", None)
+        if zero is None or zero <= 0:
+            transfer_auc[i] = 0.0
             continue
-        improv = (z - rmse_curve) / (z + eps)
-        improv = np.clip(improv, 0.0, 1.0)
-        auc = _trapz_auc(frac, improv)  # already normalized since frac in [0,1]
-        transfer_auc.append(float(np.clip(auc, 0.0, 1.0)))
-    transfer_auc = np.array(transfer_auc, dtype=np.float64)
+        frac, rmse = _get_transfer_curve(sr)
+        rmse = np.maximum(rmse, eps)
+        improvement = (zero - rmse) / zero
+        improvement = np.clip(improvement, 0.0, 1.0)
+        transfer_auc[i] = _trapz_auc(frac, improvement)
 
-    # ---------- Efficiency + BudgetPenalty ----------
-    peak_mem = np.array([sr["dynamic_eff"].get("peak_mem_mb", 0.0) for sr in stage_results], dtype=np.float64)
-    time_sec = np.array([sr["dynamic_eff"].get("train_time_sec", 0.0) for sr in stage_results], dtype=np.float64)
-    trainable_params = np.array([sr["static_eff"].get("trainable_params", 0.0) for sr in stage_results], dtype=np.float64)
-    flops = np.array([sr.get("flops", {}).get("flops", 0.0) for sr in stage_results], dtype=np.float64)
+    # ---------- EffNorm & BudgetPenalty ----------
+    peak_mem = np.array(
+        [sr.get("dynamic_eff", {}).get("peak_mem_mb", 0.0) for sr in stage_results],
+        dtype=np.float64,
+    )
+    time_sec = np.array(
+        [sr.get("dynamic_eff", {}).get("train_time_sec", 0.0) for sr in stage_results],
+        dtype=np.float64,
+    )
+    trainable_params = np.array(
+        [sr.get("static_eff", {}).get("trainable_params", 0.0) for sr in stage_results],
+        dtype=np.float64,
+    )
+    flops = np.array(
+        [sr.get("flops", {}).get("flops", 0.0) for sr in stage_results],
+        dtype=np.float64,
+    )
 
     if budgets is None:
-        mem_ref = peak_mem.max() if peak_mem.max() > 0 else 1.0
-        time_ref = time_sec.max() if time_sec.max() > 0 else 1.0
-        param_ref = trainable_params.max() if trainable_params.max() > 0 else 1.0
-        flops_ref = flops.max() if flops.max() > 0 else 1.0
+        # normalize by max within this experiment
+        mem_n = peak_mem / max(float(np.max(peak_mem)), eps)
+        time_n = time_sec / max(float(np.max(time_sec)), eps)
+        param_n = trainable_params / max(float(np.max(trainable_params)), eps)
+        flops_n = flops / max(float(np.max(flops)), eps)
 
-        usage = np.stack([
-            peak_mem / mem_ref,
-            time_sec / time_ref,
-            trainable_params / param_ref,
-            flops / flops_ref,
-        ], axis=1)
-        usage_mean = usage.mean(axis=1)
+        usage_mean = np.stack([mem_n, time_n, param_n, flops_n], axis=1).mean(axis=1)
         eff_norm = 1.0 - np.clip(usage_mean, 0.0, 1.0)
         budget_penalty = np.zeros_like(eff_norm)
 
@@ -151,7 +166,6 @@ def compute_suep(
         + w_eff * eff_norm
         - w_budget * budget_penalty
     )
-
     stage_scores = np.clip(stage_scores, -1.0, 2.0)
 
     # ---------- Difficulty Weights ----------
@@ -165,11 +179,11 @@ def compute_suep(
     return {
         "S_uep": S_uep,
         "weights": {
-            "w_perf": w_perf,
-            "w_transfer_auc": w_transfer_auc,
-            "w_eff": w_eff,
-            "w_budget": w_budget,
-            "difficulty_alpha": difficulty_alpha,
+            "w_perf": float(w_perf),
+            "w_transfer_auc": float(w_transfer_auc),
+            "w_eff": float(w_eff),
+            "w_budget": float(w_budget),
+            "difficulty_alpha": float(difficulty_alpha),
         },
         "per_stage": [
             {

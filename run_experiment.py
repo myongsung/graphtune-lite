@@ -8,8 +8,8 @@ from graphtune import prepare_dataset, build_model, load_partial_state, train_on
 
 # 아직 legacy에 남아있는 것들은 legacy에서 직접 import
 from graphtune.config import DEFAULT_MODEL_KWARGS
-from graphtune.legacy.suep import compute_suep
-from graphtune.legacy.leaderboard import print_leaderboard
+from graphtune.core.scoring import compute_suep
+from graphtune.core.leaderboard import print_leaderboard
 
 # v2 wrapper/서브패키지들
 from graphtune.budget import make_budgeted_train_loader, LossGradientBudgetScheduler
