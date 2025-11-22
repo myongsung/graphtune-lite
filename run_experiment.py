@@ -5,12 +5,14 @@ import torch
 
 from graphtune import prepare_dataset, build_model, load_partial_state
 from graphtune.config import DEFAULT_MODEL_KWARGS
-from graphtune.eval import evaluate_model
 from graphtune.train import train_one_stage
-from graphtune.efficiency import profile_model_static, estimate_flops
 from graphtune.suep import compute_suep
 from graphtune.leaderboard import print_leaderboard
 from graphtune.budget import make_budgeted_train_loader, LossGradientBudgetScheduler
+from graphtune.efficiency.static import profile_model_static
+from graphtune.efficiency.flops import estimate_flops
+from graphtune.efficiency.profiler import StageProfiler
+from graphtune.eval.evaluator import evaluate_model
 
 
 def parse_list(arg, cast_fn=str):
