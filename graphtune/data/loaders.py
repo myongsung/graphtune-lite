@@ -9,11 +9,12 @@ from .datasets import SequenceDatasetWithMask, BigSTDataset
 from .time_features import make_time_features
 
 # ⚠️ legacy __init__을 타면 사이드이펙트 있을 수 있으니 "직접 모듈"로 import
-from graphtune.legacy.utils import (
+from graphtune.utils import (
     create_sequences_with_start,
     compute_mean_std_from_train,
     StandardScaler,
 )
+
 
 def prepare_dataset(
     dataset_name: str,
