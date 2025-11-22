@@ -7,7 +7,7 @@ import torch
 from graphtune import prepare_dataset, build_model, load_partial_state, train_one_stage
 
 # 아직 legacy에 남아있는 것들은 legacy에서 직접 import
-from graphtune.legacy.config import DEFAULT_MODEL_KWARGS
+from graphtune.config import DEFAULT_MODEL_KWARGS
 from graphtune.legacy.suep import compute_suep
 from graphtune.legacy.leaderboard import print_leaderboard
 
