@@ -1,0 +1,111 @@
+import os
+import urllib.request
+from typing import Optional, Dict
+from huggingface_hub import hf_hub_download
+
+# legacy DATA_SOURCES 그대로
+DATA_SOURCES = {
+    "metr-la": {
+        "hf_repo": "jimmygao3218/METRLA",
+        "files": {
+            "h5": "metr-la.h5",
+            "adj": "adj_mx.pkl",
+            "loc": "graph_sensor_locations.csv",
+        },
+        "urls": {
+            "graph_sensor_locations.csv":
+                "https://raw.githubusercontent.com/liyaguang/DCRNN/master/data/sensor_graph/graph_sensor_locations.csv",
+        }
+    },
+    "pems-bay": {
+        "hf_repo": None,
+        "files": {
+            "h5": "pems-bay.h5",
+            "adj": "adj_mx_bay.pkl",
+            "loc": "graph_sensor_locations_bay.csv",
+        },
+        "urls": {
+            "pems-bay.h5":
+                "https://zenodo.org/records/4263971/files/pems-bay.h5?download=1",
+            "adj_mx_bay.pkl":
+                "https://zenodo.org/records/4263971/files/adj_mx_bay.pkl?download=1",
+            "graph_sensor_locations_bay.csv":
+                "https://raw.githubusercontent.com/liyaguang/DCRNN/master/data/sensor_graph/graph_sensor_locations_bay.csv",
+        }
+    }
+}
+
+def resolve_dataset_key(dataset_name: str) -> str:
+    name = dataset_name.lower()
+    if name in ["metr-la", "metr", "la"]:
+        return "metr-la"
+    if name in ["pems-bay", "bay", "pems"]:
+        return "pems-bay"
+    raise ValueError(f"Unknown dataset_name: {dataset_name}")
+
+def _download_url(url: str, dst_path: str) -> str:
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    if not os.path.exists(dst_path):
+        print(f"[download] {url} -> {dst_path}")
+        urllib.request.urlretrieve(url, dst_path)
+    return dst_path
+
+def ensure_local_file(
+    dataset_key: str,
+    kind: str,
+    data_dir: str,
+    source: str = "auto",
+    cache_dir: Optional[str] = None,
+    url_override: Optional[str] = None,
+    revision: Optional[str] = None,
+) -> str:
+    """
+    legacy _ensure_local_file 그대로.
+    """
+    ds = DATA_SOURCES[dataset_key]
+    filename = ds["files"][kind]
+    local_path = os.path.join(data_dir, filename)
+
+    if os.path.exists(local_path) and source in ["auto", "local"]:
+        return local_path
+
+    if source == "auto":
+        url = url_override or ds["urls"].get(filename)
+        if url:
+            return _download_url(url, local_path)
+
+        if ds.get("hf_repo"):
+            return hf_hub_download(
+                repo_id=ds["hf_repo"],
+                filename=filename,
+                repo_type="dataset",
+                cache_dir=cache_dir,
+                revision=revision,
+            )
+        raise FileNotFoundError(
+            f"{local_path} not found and no auto source for {dataset_key}:{filename}"
+        )
+
+    if source == "hf":
+        if ds.get("hf_repo") is None:
+            raise ValueError(f"{dataset_key} has no hf_repo. Use source='url' or 'auto'.")
+        return hf_hub_download(
+            repo_id=ds["hf_repo"],
+            filename=filename,
+            repo_type="dataset",
+            cache_dir=cache_dir,
+            revision=revision,
+        )
+
+    if source == "url":
+        url = url_override or ds["urls"].get(filename)
+        if url is None:
+            raise ValueError(f"No URL for {dataset_key}:{filename}")
+        return _download_url(url, local_path)
+
+    if source == "local":
+        if not os.path.exists(local_path):
+            raise FileNotFoundError(f"{local_path} not found. Put file manually.")
+        return local_path
+
+    raise ValueError(f"Unknown source={source}")
