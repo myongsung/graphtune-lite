@@ -1,6 +1,10 @@
 # GraphTune-lite (v2)
 **GraphTune: 데이터 탄력적 어댑터와 예산 스케줄링을 갖춘 메모리 최적화 멀티시티·멀티그래프 튜닝 벤치마크**
 
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](#installation)
+[![PyTorch](https://img.shields.io/badge/PyTorch-1.12%2B-orange.svg)](#installation)
+[![License](https://img.shields.io/badge/License-Open%20Source-green.svg)](#license)
+
 GraphTune-lite는 멀티시티/멀티그래프 시계열 예측(교통 등)에서  
 **전이 성능(Zero-shot → Few-shot → Fine-tune)**과 **자원 효율(메모리/연산/시간)**을 함께 평가하는 경량 벤치마크 파이프라인입니다.
 
