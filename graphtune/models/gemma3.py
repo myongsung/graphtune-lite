@@ -78,11 +78,7 @@ class Gemma3ForecastModel(nn.Module):
         y_hat = self.out_proj(summary)  # [B, T_out * N], float32
         y_hat = y_hat.view(B, self.T_out, self.num_nodes)
 
-        # 6) 디버그: nan_to_num 적용 *전*에 non-finite 비율 확인 (원하면)
-        if not torch.isfinite(y_hat).all():
-            bad_ratio = (~torch.isfinite(y_hat)).float().mean().item()
-            print("[WARN] non-finite predictions before nan_to_num:", bad_ratio)
-
+   
         # 7) NaN/Inf 제거
         y_hat = torch.nan_to_num(y_hat, nan=0.0, posinf=0.0, neginf=0.0)
 
