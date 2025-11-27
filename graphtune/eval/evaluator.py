@@ -1,34 +1,46 @@
-# graphtune/eval/evaluator.py
-import numpy as np
-import torch
+# graphtune/eval/evaluator.py (혹은 비슷한 위치)
 
-def evaluate_model(model, loader, scaler, device="cuda", is_bigst=False):
-    """
-    v1/legacy와 동일한 평가 함수.
-    model(x) -> pred 얻고, scaler로 denorm 후 masked MAE/RMSE 계산.
-    is_bigst는 호환용 인자(현재는 미사용)로 유지.
-    """
+import torch
+import numpy as np
+from .metrics import masked_mae_loss, masked_rmse_loss  # 실제 경로에 맞게
+
+def evaluate_model(model, loader, scaler, device="cuda"):
     model.eval()
-    preds, trues, masks = [], [], []
+    maes = []
+    rmses = []
 
     with torch.no_grad():
-        for x, y, mask in loader:
-            x, y, mask = x.to(device), y.to(device), mask.to(device)
-            out = model(x)
-            pred = out[0] if isinstance(out, tuple) else out
-            preds.append(pred.cpu())
-            trues.append(y.cpu())
-            masks.append(mask.cpu())
+        for batch in loader:
+            # (X, Y, mask) 구조라고 가정
+            x, y, mask = batch
+            x = x.to(device)
+            y = y.to(device)
+            mask = mask.to(device)
 
-    preds = torch.cat(preds, dim=0).numpy()
-    trues = torch.cat(trues, dim=0).numpy()
-    masks = torch.cat(masks, dim=0).numpy()
+            # 1) 모델 예측
+            y_hat = model(x)  # [B, T_out, N]
 
-    preds_denorm = scaler.inverse_transform(preds)
-    trues_denorm = scaler.inverse_transform(trues)
+            # 2) 역정규화
+            y_hat = scaler.inverse_transform(y_hat)
+            y = scaler.inverse_transform(y)
 
-    diff = preds_denorm - trues_denorm
-    m = masks > 0
-    mae = np.abs(diff)[m].mean()
-    rmse = np.sqrt((diff ** 2)[m].mean())
-    return float(mae), float(rmse)
+            # 3) NaN/Inf 제거 + 마스크와 AND
+            finite_mask = torch.isfinite(y_hat) & torch.isfinite(y)
+            final_mask = (mask > 0) & finite_mask
+
+            if final_mask.sum() == 0:
+                # 이 배치는 유효 포인트 없음 → 그냥 스킵
+                continue
+
+            # 4) 마스킹된 값만 사용해서 MAE/RMSE 계산
+            mae = torch.abs(y_hat - y)[final_mask].mean()
+            rmse = ((y_hat - y) ** 2)[final_mask].mean().sqrt()
+
+            maes.append(mae.item())
+            rmses.append(rmse.item())
+
+    if len(maes) == 0:
+        # 전체가 다 비어 있으면 NaN 리턴 (혹은 큰 값 리턴)
+        return float("nan"), float("nan")
+
+    return float(np.mean(maes)), float(np.mean(rmses))
