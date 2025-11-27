@@ -10,6 +10,13 @@ DEFAULT_MODEL_KWARGS = {
     "hypernet": dict(hidden_dim=32, hyper_hidden=64),
     "dcrnn": dict(hidden_dim=64, num_layers=2, K=2),
     "dgcrn": dict(hidden_dim=64, num_layers=2, K=2, emb_dim=10),
+
+      "gemma3": dict(
+        model_name="google/gemma-3-270m",
+        freeze_backbone=True,
+        dropout=0.1,
+    ),
+    
 }
 
 __all__ = ["DEFAULT_MODEL_KWARGS"]

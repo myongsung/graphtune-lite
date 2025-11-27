@@ -2,6 +2,7 @@
 from .registry import register_model
 from .baselines import BaselineModel, HyperModel, DCRNNModel, DGCRNModel
 from .bigst import BigST
+from .gemma3 import Gemma3ForecastModel   # ⬅ 추가
 
 @register_model("bigst")
 def _build_bigst(bundle, **kwargs):
@@ -49,4 +50,12 @@ def _build_dgcrn(bundle, **kwargs):
         bundle["T_in"],
         bundle["T_out"],
         **kwargs
+    )
+@register_model("gemma3")
+def _build_gemma3(bundle, **kwargs):
+    return Gemma3ForecastModel(
+        num_nodes=bundle["num_nodes"],
+        T_in=bundle["T_in"],
+        T_out=bundle["T_out"],
+        **kwargs,
     )
