@@ -55,22 +55,31 @@ class Gemma3ForecastModel(nn.Module):
         B, T, N = x.shape
         assert T == self.T_in and N == self.num_nodes
 
-        # [B, T_in, N] → [B, T_in, H]
-        h = self.input_proj(x)
+        # 1) 우리 쪽 Linear는 float32 기준으로 동작
+        #    x 도 보통 float32라 그대로 proj
+        h = self.input_proj(x)        # [B, T_in, H] (float32)
 
-        # Gemma backbone 통과
+        # 2) Gemma backbone 의 dtype 확인 (보통 float16)
+        backbone_dtype = next(self.backbone.parameters()).dtype
+
+        #    Gemma 에 넣을 때는 backbone dtype 으로 맞춰줌
+        h_for_backbone = h.to(backbone_dtype)
+
+        # 3) Gemma backbone 통과
         outputs = self.backbone.model(
-            inputs_embeds=h,
+            inputs_embeds=h_for_backbone,
             use_cache=False,
             output_hidden_states=False,
         )
-        last_hidden = outputs.last_hidden_state  # [B, T_in, H]
+        last_hidden = outputs.last_hidden_state  # [B, T_in, H], dtype = backbone_dtype
 
-        # 마지막 토큰 hidden을 summary 로 사용
-        summary = last_hidden[:, -1, :]  # [B, H]
+        # 4) summary 는 다시 우리 Linear 쪽 dtype (float32) 로 되돌림
+        summary = last_hidden[:, -1, :].to(h.dtype)  # [B, H], float32
 
-        # [B, H] → [B, T_out, N]
-        y_hat = self.out_proj(summary)      # [B, T_out * N]
+        # 5) 출력 proj: [B, H] → [B, T_out * N]
+        y_hat = self.out_proj(summary)               # [B, T_out * N], float32
         y_hat = y_hat.view(B, self.T_out, self.num_nodes)
 
+        # 6) (옵션) 입력 x 와 dtype 맞추고 싶으면:
+        # return y_hat.to(x.dtype)
         return y_hat
