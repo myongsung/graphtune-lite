@@ -1,46 +1,51 @@
-# graphtune/eval/evaluator.py (혹은 비슷한 위치)
-
-import torch
+# graphtune/eval/evaluator.py
 import numpy as np
-from .metrics import masked_mae_loss, masked_rmse_loss  # 실제 경로에 맞게
+import torch
 
-def evaluate_model(model, loader, scaler, device="cuda"):
+def evaluate_model(model, loader, scaler, device="cuda", is_bigst=False):
+    """
+    model(x) -> pred 얻고, scaler로 denorm 후 masked MAE/RMSE 계산.
+    torch 텐서 기반으로 NaN/Inf 를 안전하게 처리한다.
+    """
     model.eval()
     maes = []
     rmses = []
 
     with torch.no_grad():
-        for batch in loader:
-            # (X, Y, mask) 구조라고 가정
-            x, y, mask = batch
+        for x, y, mask in loader:
             x = x.to(device)
             y = y.to(device)
             mask = mask.to(device)
 
             # 1) 모델 예측
-            y_hat = model(x)  # [B, T_out, N]
+            pred = model(x)  # [B, T_out, N]
 
-            # 2) 역정규화
-            y_hat = scaler.inverse_transform(y_hat)
-            y = scaler.inverse_transform(y)
+            # 2) 역정규화 (scaler 가 torch 텐서를 지원하도록 수정해 둔 상태)
+            pred_denorm = scaler.inverse_transform(pred)
+            y_denorm = scaler.inverse_transform(y)
 
-            # 3) NaN/Inf 제거 + 마스크와 AND
-            finite_mask = torch.isfinite(y_hat) & torch.isfinite(y)
-            final_mask = (mask > 0) & finite_mask
+            # 3) 차이 + 유효한 위치 마스크
+            diff = pred_denorm - y_denorm
 
-            if final_mask.sum() == 0:
-                # 이 배치는 유효 포인트 없음 → 그냥 스킵
+            # 유한한 값만 사용 (NaN/Inf 제거)
+            finite = torch.isfinite(diff) & torch.isfinite(y_denorm) & torch.isfinite(pred_denorm)
+
+            # 원래 마스크(mask>0) 와 AND
+            m = (mask > 0) & finite
+
+            if m.sum() == 0:
+                # 이 배치는 유효 포인트 없음 → 스킵
                 continue
 
-            # 4) 마스킹된 값만 사용해서 MAE/RMSE 계산
-            mae = torch.abs(y_hat - y)[final_mask].mean()
-            rmse = ((y_hat - y) ** 2)[final_mask].mean().sqrt()
+            # 4) MAE / RMSE 계산
+            mae = torch.abs(diff[m]).mean()
+            rmse = torch.sqrt((diff[m] ** 2).mean())
 
             maes.append(mae.item())
             rmses.append(rmse.item())
 
-    if len(maes) == 0:
-        # 전체가 다 비어 있으면 NaN 리턴 (혹은 큰 값 리턴)
+    if not maes:
+        # 전체가 다 비어 있으면 NaN 리턴
         return float("nan"), float("nan")
 
     return float(np.mean(maes)), float(np.mean(rmses))
