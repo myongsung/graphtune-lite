@@ -12,7 +12,7 @@ DEFAULT_MODEL_KWARGS = {
     "dgcrn": dict(hidden_dim=64, num_layers=2, K=2, emb_dim=10),
 
       "gemma3": dict(
-        model_name="google/gemma-3-270m",
+        hf_model_name="google/gemma-3-270m",  # ⬅ 키 이름 변경
         freeze_backbone=True,
         dropout=0.1,
     ),

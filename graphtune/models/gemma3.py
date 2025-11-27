@@ -24,7 +24,7 @@ class Gemma3ForecastModel(nn.Module):
         num_nodes: int,
         T_in: int,
         T_out: int,
-        model_name: str = "google/gemma-3-270m",
+        hf_model_name: str = "google/gemma-3-270m",  # ⬅ 이름 변경
         freeze_backbone: bool = True,
         dropout: float = 0.1,
         **kwargs,
