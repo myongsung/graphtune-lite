@@ -4,48 +4,31 @@ import torch
 
 def evaluate_model(model, loader, scaler, device="cuda", is_bigst=False):
     """
+    v1/legacy와 동일한 평가 함수.
     model(x) -> pred 얻고, scaler로 denorm 후 masked MAE/RMSE 계산.
-    torch 텐서 기반으로 NaN/Inf 를 안전하게 처리한다.
+    is_bigst는 호환용 인자(현재는 미사용)로 유지.
     """
     model.eval()
-    maes = []
-    rmses = []
+    preds, trues, masks = [], [], []
 
     with torch.no_grad():
         for x, y, mask in loader:
-            x = x.to(device)
-            y = y.to(device)
-            mask = mask.to(device)
+            x, y, mask = x.to(device), y.to(device), mask.to(device)
+            out = model(x)
+            pred = out[0] if isinstance(out, tuple) else out
+            preds.append(pred.cpu())
+            trues.append(y.cpu())
+            masks.append(mask.cpu())
 
-            # 1) 모델 예측
-            pred = model(x)  # [B, T_out, N]
+    preds = torch.cat(preds, dim=0).numpy()
+    trues = torch.cat(trues, dim=0).numpy()
+    masks = torch.cat(masks, dim=0).numpy()
 
-            # 2) 역정규화 (scaler 가 torch 텐서를 지원하도록 수정해 둔 상태)
-            pred_denorm = scaler.inverse_transform(pred)
-            y_denorm = scaler.inverse_transform(y)
+    preds_denorm = scaler.inverse_transform(preds)
+    trues_denorm = scaler.inverse_transform(trues)
 
-            # 3) 차이 + 유효한 위치 마스크
-            diff = pred_denorm - y_denorm
-
-            # 유한한 값만 사용 (NaN/Inf 제거)
-            finite = torch.isfinite(diff) & torch.isfinite(y_denorm) & torch.isfinite(pred_denorm)
-
-            # 원래 마스크(mask>0) 와 AND
-            m = (mask > 0) & finite
-
-            if m.sum() == 0:
-                # 이 배치는 유효 포인트 없음 → 스킵
-                continue
-
-            # 4) MAE / RMSE 계산
-            mae = torch.abs(diff[m]).mean()
-            rmse = torch.sqrt((diff[m] ** 2).mean())
-
-            maes.append(mae.item())
-            rmses.append(rmse.item())
-
-    if not maes:
-        # 전체가 다 비어 있으면 NaN 리턴
-        return float("nan"), float("nan")
-
-    return float(np.mean(maes)), float(np.mean(rmses))
+    diff = preds_denorm - trues_denorm
+    m = masks > 0
+    mae = np.abs(diff)[m].mean()
+    rmse = np.sqrt((diff ** 2)[m].mean())
+    return float(mae), float(rmse)
