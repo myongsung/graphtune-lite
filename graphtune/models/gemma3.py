@@ -47,39 +47,39 @@ class Gemma3ForecastModel(nn.Module):
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x : [B, T_in, N]
-        return : [B, T_out, N]
-        """
-        B, T, N = x.shape
-        assert T == self.T_in and N == self.num_nodes
+def forward(self, x: torch.Tensor) -> torch.Tensor:
+    B, T, N = x.shape
+    assert T == self.T_in and N == self.num_nodes
 
-        # 1) 우리 쪽 Linear는 float32 기준으로 동작
-        #    x 도 보통 float32라 그대로 proj
-        h = self.input_proj(x)        # [B, T_in, H] (float32)
+    # [B, T_in, N] → [B, T_in, H] (float32)
+    h = self.input_proj(x)
 
-        # 2) Gemma backbone 의 dtype 확인 (보통 float16)
-        backbone_dtype = next(self.backbone.parameters()).dtype
+    # Gemma backbone dtype (보통 float16)
+    backbone_dtype = next(self.backbone.parameters()).dtype
+    h_for_backbone = h.to(backbone_dtype)
 
-        #    Gemma 에 넣을 때는 backbone dtype 으로 맞춰줌
-        h_for_backbone = h.to(backbone_dtype)
+    # Gemma backbone 통과
+    outputs = self.backbone.model(
+        inputs_embeds=h_for_backbone,
+        use_cache=False,
+        output_hidden_states=False,
+    )
+    last_hidden = outputs.last_hidden_state  # [B, T_in, H], half
 
-        # 3) Gemma backbone 통과
-        outputs = self.backbone.model(
-            inputs_embeds=h_for_backbone,
-            use_cache=False,
-            output_hidden_states=False,
-        )
-        last_hidden = outputs.last_hidden_state  # [B, T_in, H], dtype = backbone_dtype
+    # 마지막 토큰 summary → 다시 float32
+    summary = last_hidden[:, -1, :].to(h.dtype)  # [B, H], float32
 
-        # 4) summary 는 다시 우리 Linear 쪽 dtype (float32) 로 되돌림
-        summary = last_hidden[:, -1, :].to(h.dtype)  # [B, H], float32
+    # 출력 proj: [B, H] → [B, T_out * N]
+    y_hat = self.out_proj(summary)  # [B, T_out * N], float32
+    y_hat = y_hat.view(B, self.T_out, self.num_nodes)
 
-        # 5) 출력 proj: [B, H] → [B, T_out * N]
-        y_hat = self.out_proj(summary)               # [B, T_out * N], float32
-        y_hat = y_hat.view(B, self.T_out, self.num_nodes)
+    # 🔎 디버그: nan_to_num 적용 *전*에 얼마나 망가졌는지 보고 싶으면
+    if not torch.isfinite(y_hat).all():
+        bad_ratio = (~torch.isfinite(y_hat)).float().mean().item()
+        print("[WARN] non-finite predictions before nan_to_num:", bad_ratio)
 
-        # 6) (옵션) 입력 x 와 dtype 맞추고 싶으면:
-        # return y_hat.to(x.dtype)
-        return y_hat
+    # 🔥 여기서 NaN/Inf 제거
+    y_hat = torch.nan_to_num(y_hat, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return y_hat
+
