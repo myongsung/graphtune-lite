@@ -13,7 +13,7 @@ DEFAULT_MODEL_KWARGS = {
 
     "gemma3": dict(
         hf_model_name="google/gemma-3-270m",
-        freeze_backbone=True,          # 처음엔 그대로 freeze 상태
+        freeze_backbone=False,          # 처음엔 그대로 freeze 상태
         train_backbone_last_n=None,    # 예: 2 로 바꾸면 마지막 2개 레이어만 학습
         dropout=0.1,
         use_graph_encoder=True,
