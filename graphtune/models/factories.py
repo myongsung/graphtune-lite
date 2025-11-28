@@ -51,11 +51,14 @@ def _build_dgcrn(bundle, **kwargs):
         bundle["T_out"],
         **kwargs
     )
+
 @register_model("gemma3")
 def _build_gemma3(bundle, **kwargs):
     return Gemma3ForecastModel(
         num_nodes=bundle["num_nodes"],
         T_in=bundle["T_in"],
         T_out=bundle["T_out"],
+        A=bundle.get("A", None),
+        coords=bundle.get("coords", None),
         **kwargs,
     )
