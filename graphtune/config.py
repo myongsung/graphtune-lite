@@ -13,13 +13,12 @@ DEFAULT_MODEL_KWARGS = {
 
     "gemma3": dict(
         hf_model_name="google/gemma-3-270m",
-        freeze_backbone=False,          # 처음엔 그대로 freeze 상태
-        train_backbone_last_n=None,    # 예: 2 로 바꾸면 마지막 2개 레이어만 학습
+        freeze_backbone=False,          # 🔥 전체 파인튜닝 켜기
         dropout=0.1,
-        use_graph_encoder=True,
-        use_coords=True,
-        temporal_pooling="attn",       # "last", "mean", "max", "attn" 중 택
-        adapter_dim=64,
+        use_graph_encoder=True,         # 그래프 인코더 사용
+        use_coords=True,               # coords 기반 node weight 사용
+        temporal_pooling="attn",        # last 대신 attention pooling
+        adapter_dim=64,                 # 작은 bottleneck adapter
     ),
     
 }

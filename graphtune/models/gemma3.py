@@ -14,9 +14,9 @@ class Gemma3ForecastModel(nn.Module):
     추가 기능:
       - 그래프 인코딩 (adjacency 기반 이웃 평균)
       - coords 기반 노드 가중치
-      - 시간축 pooling (last / mean / max / attn)
-      - backbone 일부 레이어만 학습 (train_backbone_last_n)
+      - 시간 pooling (last / mean / max / attn)
       - sequence adapter (작은 bottleneck MLP)
+      - backbone 전체 fine-tuning (freeze_backbone=False)
     """
 
     def __init__(
@@ -25,18 +25,17 @@ class Gemma3ForecastModel(nn.Module):
         T_in: int,
         T_out: int,
         hf_model_name: str = "google/gemma-3-270m",
-        freeze_backbone: bool = True,
-        train_backbone_last_n: int | None = None,
+        freeze_backbone: bool = False,      # 🔥 기본값: 전체 파인튜닝
         dropout: float = 0.1,
         # --- 그래프 관련 ---
-        A=None,                 # adjacency matrix (numpy or tensor) [N, N]
+        A=None,                             # adjacency matrix [N, N]
         use_graph_encoder: bool = True,
-        coords=None,            # [N, 2] 혹은 [N, d]
+        coords=None,                        # [N, d]
         use_coords: bool = True,
         # --- 시간 pooling ---
-        temporal_pooling: str = "attn",  # "last" | "mean" | "max" | "attn"
+        temporal_pooling: str = "attn",     # "last" | "mean" | "max" | "attn"
         # --- adapter ---
-        adapter_dim: int | None = 64,
+        adapter_dim: int = 64,              # 0 또는 None이면 비활성
         **kwargs,
     ):
         super().__init__()
@@ -52,23 +51,22 @@ class Gemma3ForecastModel(nn.Module):
         )
         hidden_size = self.backbone.config.hidden_size
 
-        # 1) 그래프 인코더 준비
+        # 1) 그래프 인코더 준비 (A normalize)
         self.use_graph_encoder = use_graph_encoder and (A is not None)
         if self.use_graph_encoder:
             A = torch.as_tensor(A, dtype=torch.float32)
-            # 간단한 대칭 normalize: D^{-1/2} (A + I) D^{-1/2}
             N = A.size(0)
             I = torch.eye(N, device=A.device)
-            A_hat = A + I
+            A_hat = A + I  # self loop 포함
             deg = A_hat.sum(dim=-1)  # [N]
             deg_inv_sqrt = (deg + 1e-6).pow(-0.5)
             D_inv_sqrt = torch.diag(deg_inv_sqrt)
-            A_norm = D_inv_sqrt @ A_hat @ D_inv_sqrt   # [N, N]
+            A_norm = D_inv_sqrt @ A_hat @ D_inv_sqrt  # [N, N]
             self.register_buffer("A_norm", A_norm)
         else:
             self.A_norm = None
 
-        # 2) coords 기반 노드 가중치
+        # 2) coords 기반 노드 weight
         self.use_coords = use_coords and (coords is not None)
         if self.use_coords:
             coords_t = torch.as_tensor(coords, dtype=torch.float32)  # [N, d]
@@ -86,7 +84,7 @@ class Gemma3ForecastModel(nn.Module):
         # 3) 입력 proj: [B, T_in, N] -> [B, T_in, H]
         self.input_proj = nn.Linear(num_nodes, hidden_size)
 
-        # 4) sequence adapter (LoRA 비슷한 bottleneck)
+        # 4) sequence adapter (LoRA 비슷한 bottleneck MLP)
         if adapter_dim is not None and adapter_dim > 0:
             self.adapter = nn.Sequential(
                 nn.Linear(hidden_size, adapter_dim),
@@ -108,45 +106,15 @@ class Gemma3ForecastModel(nn.Module):
             nn.Linear(hidden_size, T_out * num_nodes),
         )
 
-        # 7) backbone 파라미터 freeze / partial unfreeze
-        self._configure_backbone_freeze(
-            freeze_backbone=freeze_backbone,
-            train_backbone_last_n=train_backbone_last_n,
-        )
-
-    # ---------------------------------------------------------------
-    # backbone 파라미터 동결/부분 해제
-    # ---------------------------------------------------------------
-    def _configure_backbone_freeze(self, freeze_backbone: bool, train_backbone_last_n: int | None):
-        # 전체 freeze
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-
-        if not freeze_backbone:
-            # 완전 unfreeze (모든 레이어 학습)
-            for p in self.backbone.parameters():
-                p.requires_grad = True
-
-        if train_backbone_last_n is not None and train_backbone_last_n > 0:
-            # 일단 전체 freeze 시켜놓고 → 마지막 n개 레이어만 풀어줌
+        # 7) backbone freeze 옵션
+        if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
-            # Gemma 구조에 따라 attribute 이름 다를 수 있음 → 안전하게 시도
-            blocks = None
-            if hasattr(self.backbone, "model") and hasattr(self.backbone.model, "layers"):
-                blocks = self.backbone.model.layers
-            elif hasattr(self.backbone, "transformer") and hasattr(self.backbone.transformer, "layers"):
-                blocks = self.backbone.transformer.layers
+        # freeze_backbone=False 이면 기본값(전체 학습) 그대로 둠
 
-            if blocks is not None:
-                for block in blocks[-train_backbone_last_n:]:
-                    for p in block.parameters():
-                        p.requires_grad = True
-            # blocks 를 못 찾으면 그냥 전부 freeze 된 상태로 두는 셈
-
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------
     # forward
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x : [B, T_in, N]
@@ -155,18 +123,16 @@ class Gemma3ForecastModel(nn.Module):
         B, T, N = x.shape
         assert T == self.T_in and N == self.num_nodes
 
-        # 0) 그래프 인코딩: (A_norm * x) 와 평균
+        # 0) 그래프 인코딩: self + neighbor 평균
         if self.use_graph_encoder and self.A_norm is not None:
             # x: [B, T, N], A_norm: [N, N]
-            # 이웃 집계: [B, T, N] ← x @ A_norm^T
-            x_neigh = torch.einsum("btn,nm->btm", x, self.A_norm)
-            x = 0.5 * (x + x_neigh)  # self + neighbor 평균
+            x_neigh = torch.einsum("btn,nm->btm", x, self.A_norm)  # 이웃 집계
+            x = 0.5 * (x + x_neigh)
 
         # 1) coords 기반 노드 weight
         if self.use_coords and self.coords_tensor is not None:
-            # coords_tensor: [N, d] → node_w: [N, 1]
             node_w = self.coord_mlp(self.coords_tensor)  # [N, 1]
-            node_w = node_w.view(1, 1, N)                # [1, 1, N] broadcast
+            node_w = node_w.view(1, 1, N)               # [1, 1, N]
             x = x * node_w
 
         # 2) 입력 proj: [B, T_in, N] → [B, T_in, H] (float32)
@@ -185,7 +151,7 @@ class Gemma3ForecastModel(nn.Module):
         seq_hidden = outputs.last_hidden_state  # [B, T_in, H], half
         seq_hidden = seq_hidden.to(h.dtype)     # 다시 float32
 
-        # 5) adapter (있으면 residual 로 추가)
+        # 5) adapter residual
         if self.adapter is not None:
             seq_hidden = seq_hidden + self.adapter(seq_hidden)
 
@@ -198,19 +164,17 @@ class Gemma3ForecastModel(nn.Module):
             summary, _ = seq_hidden.max(dim=1)
         elif self.temporal_pooling == "attn" and self.time_query is not None:
             q = self.time_query.to(seq_hidden.dtype)  # [H]
-            # attention score: dot(q, h_t)
             scores = torch.einsum("bth,h->bt", seq_hidden, q) / math.sqrt(seq_hidden.size(-1))
             attn = torch.softmax(scores, dim=1).unsqueeze(-1)  # [B, T, 1]
             summary = (seq_hidden * attn).sum(dim=1)           # [B, H]
         else:
-            # fallback: last
             summary = seq_hidden[:, -1, :]
 
         # 7) 출력 proj: [B, H] → [B, T_out, N]
         y_hat = self.out_proj(summary)                # [B, T_out * N]
         y_hat = y_hat.view(B, self.T_out, self.num_nodes)
 
-        # 8) NaN/Inf 제거 (half 연산 폭주 방지)
+        # 8) NaN/Inf 제거 (half 연산 폭주 안전장치)
         y_hat = torch.nan_to_num(y_hat, nan=0.0, posinf=0.0, neginf=0.0)
 
         return y_hat
