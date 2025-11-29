@@ -3,6 +3,9 @@ import json
 import numpy as np
 import torch
 
+# HF LLM (Gemma 등)용
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
 # 최상위 API (v2 facade)
 from graphtune import prepare_dataset, build_model, load_partial_state, train_one_stage
 
@@ -31,11 +34,12 @@ def compute_graph_difficulty(A_np: np.ndarray, num_nodes: int) -> float:
 
 def compute_rag_summary(all_stage_results):
     """
-    간단한 RAG-view 요약:
+    간단한 domain-transfer 요약:
       - source: stage 0
       - target: stage 1
       - zero-shot RMSE: target.zero_rmse
       - fine-tuned RMSE: target.test_rmse (curve_rmse 마지막 값과 일치)
+    LLM 프롬프트에 넣을 컨텍스트로 사용.
     """
     if len(all_stage_results) < 2:
         return None
@@ -64,6 +68,114 @@ def compute_rag_summary(all_stage_results):
         "curve_rmse": tgt.get("curve_rmse", []),
     }
     return rag
+
+
+def build_rag_prompt(all_stage_results, rag_summary=None):
+    """
+    GraphTune 실험 결과를 요약해서 LLM에 던질 프롬프트 구성.
+    """
+    lines = []
+    lines.append(
+        "You are a traffic forecasting analyst. "
+        "You will see evaluation results of a graph-based traffic prediction model "
+        "across multiple city datasets.\n"
+    )
+
+    # 각 stage 요약
+    for sr in all_stage_results:
+        ds = sr.get("dataset", "unknown")
+        stage = sr.get("stage", -1)
+        test_rmse = sr.get("test_rmse", None)
+        zero_rmse = sr.get("zero_rmse", None)
+
+        if zero_rmse is None:
+            # pretrain / first stage
+            if test_rmse is not None:
+                lines.append(
+                    f"- Stage {stage} (dataset={ds}): "
+                    f"RMSE on test set after training = {test_rmse:.4f}."
+                )
+        else:
+            # transfer stage
+            lines.append(
+                f"- Stage {stage} (dataset={ds}): "
+                f"zero-shot RMSE on test = {zero_rmse:.4f}, "
+                f"fine-tuned RMSE on test = {test_rmse:.4f}."
+            )
+
+    # domain transfer 요약도 있으면 추가
+    if rag_summary is not None:
+        lines.append("\nDomain-transfer view (source -> target):")
+        lines.append(
+            f"- Source dataset: {rag_summary['source_dataset']} "
+            f"(stage {rag_summary['source_stage']})"
+        )
+        lines.append(
+            f"- Target dataset: {rag_summary['target_dataset']} "
+            f"(stage {rag_summary['target_stage']})"
+        )
+        lines.append(
+            f"- Zero-shot RMSE = {rag_summary['rag_zero_rmse']:.4f}, "
+            f"fine-tuned RMSE = {rag_summary['rag_ft_rmse']:.4f} "
+            f"(absolute gain = {rag_summary['rag_gain_abs']:.4f}, "
+            f"relative gain = {rag_summary['rag_gain_rel']*100:.2f}% )."
+        )
+
+    lines.append(
+        "\nBased on these metrics, write a short English commentary (2-3 sentences) "
+        "describing how well the model predicts traffic, how performance transfers "
+        "from the source city to the target city, and any trade-offs between "
+        "performance and efficiency you can infer. Do not repeat the numbers verbatim; "
+        "summarize them in natural language."
+    )
+
+    return "\n".join(lines)
+
+
+def generate_rag_commentary(all_stage_results, llm_name: str, device: str):
+    """
+    기존 그래프 모델(BigST 등)이 예측한 결과(all_stage_results)를
+    'retrieved structured context'로 보고,
+    Gemma 같은 LLM이 영어로 교통 예측 중계를 해주는 RAG-style 레이어.
+    """
+    rag_summary = compute_rag_summary(all_stage_results)
+    prompt = build_rag_prompt(all_stage_results, rag_summary)
+
+    print(f"\n[RAG] Using LLM `{llm_name}` to generate commentary...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(llm_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            llm_name,
+            torch_dtype=torch.float16 if (device == "cuda" and torch.cuda.is_available()) else torch.float32,
+        )
+    except Exception as e:
+        print(f"[RAG] Failed to load LLM `{llm_name}`: {e}")
+        return None
+
+    model.to(device)
+    model.eval()
+
+    inputs = tokenizer(prompt, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=256,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    full_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+    # 프롬프트 부분은 빼고, 뒤쪽 commentary만 대충 추출
+    if full_text.startswith(prompt):
+        commentary = full_text[len(prompt):].strip()
+    else:
+        commentary = full_text.strip()
+
+    print("\n[RAG Commentary]\n" + commentary + "\n")
+    return commentary
 
 
 def main():
@@ -111,6 +223,13 @@ def main():
     p.add_argument("--budget_time_sec", type=float, default=None)
     p.add_argument("--budget_flops_g", type=float, default=None)
     p.add_argument("--budget_trainable_m", type=float, default=None)
+
+    # ----- RAG LLM (optional) -----
+    p.add_argument(
+        "--rag_llm", type=str, default=None,
+        help="Optional HF model name (e.g., google/gemma-3-270m) "
+             "to generate an English RAG-style commentary on top of the numeric results."
+    )
 
     # output
     p.add_argument("--out_json", type=str, default="results.json")
@@ -369,30 +488,18 @@ def main():
 
     print("\nAll stages done!")
 
-    # ----- RAG-style 요약 (model = gemma3 일 때만) -----
-    rag_summary = None
-    if model_name == "gemma3":
-        rag_summary = compute_rag_summary(all_stage_results)
-        if rag_summary is not None:
-            # target stage 결과 dict에 rag_* 필드 추가
-            target_stage = rag_summary["target_stage"]
+    # ----- RAG-style 영어 중계 (rag_llm 지정된 경우에만) -----
+    rag_commentary = None
+    if args.rag_llm is not None:
+        rag_commentary = generate_rag_commentary(
+            all_stage_results,
+            llm_name=args.rag_llm,
+            device=device,
+        )
+        # JSON에서 쉽게 보이도록 모든 stage에 동일 commentary 추가
+        if rag_commentary is not None:
             for sr in all_stage_results:
-                if sr["stage"] == target_stage:
-                    sr["rag_zero_rmse"] = rag_summary["rag_zero_rmse"]
-                    sr["rag_ft_rmse"] = rag_summary["rag_ft_rmse"]
-                    sr["rag_gain_abs"] = rag_summary["rag_gain_abs"]
-                    sr["rag_gain_rel"] = rag_summary["rag_gain_rel"]
-                    break
-
-            # 콘솔 출력용 RAG 뷰
-            print("\n[RAG-view] "
-                  f"{rag_summary['source_dataset']} (stage {rag_summary['source_stage']}) "
-                  f"→ {rag_summary['target_dataset']} (stage {rag_summary['target_stage']}) "
-                  f"[model={model_name}]")
-            print(f"  zero-shot RMSE = {rag_summary['rag_zero_rmse']:.4f}")
-            print(f"  fine-tuned RMSE = {rag_summary['rag_ft_rmse']:.4f}")
-            print(f"  gain_abs = {rag_summary['rag_gain_abs']:.4f} "
-                  f"(gain_rel = {rag_summary['rag_gain_rel'] * 100:.2f}%)")
+                sr["rag_commentary"] = rag_commentary
 
     # save json/csv
     try:
@@ -416,8 +523,6 @@ def main():
                     "transfer_auc", "eff_norm", "budget_penalty",
                     "difficulty", "difficulty_weight",
                     "stage_score",
-                    # RAG-view metrics (gemma3에서 target stage에만 채워짐)
-                    "rag_zero_rmse", "rag_ft_rmse", "rag_gain_abs", "rag_gain_rel",
                 ]
             )
             writer.writeheader()
@@ -444,10 +549,6 @@ def main():
                     "difficulty": sr.get("difficulty"),
                     "difficulty_weight": sr.get("difficulty_weight"),
                     "stage_score": sr.get("stage_score"),
-                    "rag_zero_rmse": sr.get("rag_zero_rmse"),
-                    "rag_ft_rmse": sr.get("rag_ft_rmse"),
-                    "rag_gain_abs": sr.get("rag_gain_abs"),
-                    "rag_gain_rel": sr.get("rag_gain_rel"),
                 })
         print(f"[Saved] {args.out_csv}")
     except Exception as e:
