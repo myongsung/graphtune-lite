@@ -19,7 +19,6 @@ from graphtune.efficiency.profiler import StageProfiler
 from graphtune.eval.evaluator import evaluate_model
 
 
-
 def parse_list(arg, cast_fn=str):
     return [cast_fn(x) for x in arg.split(",") if x.strip()]
 
@@ -30,10 +29,47 @@ def compute_graph_difficulty(A_np: np.ndarray, num_nodes: int) -> float:
     return float(num_nodes * np.log1p(avg_deg))
 
 
+def compute_rag_summary(all_stage_results):
+    """
+    간단한 RAG-view 요약:
+      - source: stage 0
+      - target: stage 1
+      - zero-shot RMSE: target.zero_rmse
+      - fine-tuned RMSE: target.test_rmse (curve_rmse 마지막 값과 일치)
+    """
+    if len(all_stage_results) < 2:
+        return None
+
+    src = all_stage_results[0]
+    tgt = all_stage_results[1]
+
+    zero_rmse = tgt.get("zero_rmse", None)
+    ft_rmse = tgt.get("test_rmse", None)
+
+    if zero_rmse is None or ft_rmse is None:
+        return None
+
+    gain_abs = float(zero_rmse) - float(ft_rmse)
+    gain_rel = gain_abs / float(zero_rmse) if zero_rmse > 0 else 0.0
+
+    rag = {
+        "source_stage": int(src.get("stage", 0)),
+        "source_dataset": src.get("dataset"),
+        "target_stage": int(tgt.get("stage", 1)),
+        "target_dataset": tgt.get("dataset"),
+        "rag_zero_rmse": float(zero_rmse),
+        "rag_ft_rmse": float(ft_rmse),
+        "rag_gain_abs": float(gain_abs),
+        "rag_gain_rel": float(gain_rel),
+        "curve_rmse": tgt.get("curve_rmse", []),
+    }
+    return rag
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", type=str, required=True,
-                   help="bigst | baseline | hypernet | dcrnn | dgcrn")
+                   help="bigst | baseline | hypernet | dcrnn | dgcrn | gemma3")
     p.add_argument("--datasets", type=str, required=True,
                    help="comma-separated order, e.g. metr-la,pems-bay")
     p.add_argument("--epochs", type=str, default="50",
@@ -55,7 +91,7 @@ def main():
     p.add_argument("--fractions", type=str, default="0.1,0.3,1.0",
                    help="budget fractions for transfer curve, e.g. 0.05,0.1,0.2,0.5,1.0")
     p.add_argument("--fewshot_mode", type=str, default="subset",
-                   choices=["subset","steps","both"],
+                   choices=["subset", "steps", "both"],
                    help="how to enforce low-budget training")
 
     # ----- Loss-Gradient scheduler -----
@@ -333,6 +369,31 @@ def main():
 
     print("\nAll stages done!")
 
+    # ----- RAG-style 요약 (model = gemma3 일 때만) -----
+    rag_summary = None
+    if model_name == "gemma3":
+        rag_summary = compute_rag_summary(all_stage_results)
+        if rag_summary is not None:
+            # target stage 결과 dict에 rag_* 필드 추가
+            target_stage = rag_summary["target_stage"]
+            for sr in all_stage_results:
+                if sr["stage"] == target_stage:
+                    sr["rag_zero_rmse"] = rag_summary["rag_zero_rmse"]
+                    sr["rag_ft_rmse"] = rag_summary["rag_ft_rmse"]
+                    sr["rag_gain_abs"] = rag_summary["rag_gain_abs"]
+                    sr["rag_gain_rel"] = rag_summary["rag_gain_rel"]
+                    break
+
+            # 콘솔 출력용 RAG 뷰
+            print("\n[RAG-view] "
+                  f"{rag_summary['source_dataset']} (stage {rag_summary['source_stage']}) "
+                  f"→ {rag_summary['target_dataset']} (stage {rag_summary['target_stage']}) "
+                  f"[model={model_name}]")
+            print(f"  zero-shot RMSE = {rag_summary['rag_zero_rmse']:.4f}")
+            print(f"  fine-tuned RMSE = {rag_summary['rag_ft_rmse']:.4f}")
+            print(f"  gain_abs = {rag_summary['rag_gain_abs']:.4f} "
+                  f"(gain_rel = {rag_summary['rag_gain_rel'] * 100:.2f}%)")
+
     # save json/csv
     try:
         with open(args.out_json, "w") as f:
@@ -347,19 +408,23 @@ def main():
             writer = csv.DictWriter(
                 f,
                 fieldnames=[
-                    "stage","dataset","model",
-                    "zero_rmse","test_rmse",
-                    "train_time_sec","peak_mem_mb",
-                    "total_params","trainable_params","param_size_mb",
-                    "flops","macs",
-                    "transfer_auc","eff_norm","budget_penalty",
-                    "difficulty","difficulty_weight",
-                    "stage_score"
+                    "stage", "dataset", "model",
+                    "zero_rmse", "test_rmse",
+                    "train_time_sec", "peak_mem_mb",
+                    "total_params", "trainable_params", "param_size_mb",
+                    "flops", "macs",
+                    "transfer_auc", "eff_norm", "budget_penalty",
+                    "difficulty", "difficulty_weight",
+                    "stage_score",
+                    # RAG-view metrics (gemma3에서 target stage에만 채워짐)
+                    "rag_zero_rmse", "rag_ft_rmse", "rag_gain_abs", "rag_gain_rel",
                 ]
             )
             writer.writeheader()
             for sr in all_stage_results:
-                st=sr["static_eff"]; dy=sr["dynamic_eff"]; fl=sr.get("flops",{})
+                st = sr["static_eff"]
+                dy = sr["dynamic_eff"]
+                fl = sr.get("flops", {})
                 writer.writerow({
                     "stage": sr["stage"],
                     "dataset": sr["dataset"],
@@ -379,6 +444,10 @@ def main():
                     "difficulty": sr.get("difficulty"),
                     "difficulty_weight": sr.get("difficulty_weight"),
                     "stage_score": sr.get("stage_score"),
+                    "rag_zero_rmse": sr.get("rag_zero_rmse"),
+                    "rag_ft_rmse": sr.get("rag_ft_rmse"),
+                    "rag_gain_abs": sr.get("rag_gain_abs"),
+                    "rag_gain_rel": sr.get("rag_gain_rel"),
                 })
         print(f"[Saved] {args.out_csv}")
     except Exception as e:
