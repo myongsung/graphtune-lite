@@ -69,65 +69,128 @@ def compute_rag_summary(all_stage_results):
     }
     return rag
 
+def format_budget_curve(curve_rmse):
+    """
+    curve_rmse: list of (fraction, rmse)
+    를 사람이 읽기 좋은 텍스트로 바꾼다.
+    """
+    if not curve_rmse:
+        return "  (no budget curve recorded)\n"
+    lines = []
+    for frac, rmse in curve_rmse:
+        lines.append(f"  - budget_fraction = {frac:.2f} → test_RMSE = {rmse:.4f}")
+    return "\n".join(lines) + "\n"
+
 
 def build_rag_prompt(all_stage_results, rag_summary=None):
     """
-    GraphTune 실험 결과를 요약해서 LLM에 던질 프롬프트 구성.
+    GraphTune 실험 결과를 RAG 컨텍스트 + 질문 세트로 만들어서
+    LLM에 던질 프롬프트를 구성한다.
     """
+
     lines = []
     lines.append(
-        "You are a traffic forecasting analyst. "
-        "You will see evaluation results of a graph-based traffic prediction model "
-        "across multiple city datasets.\n"
+        "You are an expert traffic forecasting analyst.\n"
+        "You will see evaluation results of a graph-based traffic prediction model\n"
+        "across multiple city datasets, along with budgeted fine-tuning curves.\n"
     )
 
-    # 각 stage 요약
+    # -------- [CONTEXT] 섹션: 실험 결과를 "retrieved docs"처럼 깔기 --------
+    lines.append("### CONTEXT\n")
+
     for sr in all_stage_results:
         ds = sr.get("dataset", "unknown")
         stage = sr.get("stage", -1)
         test_rmse = sr.get("test_rmse", None)
         zero_rmse = sr.get("zero_rmse", None)
+        diff = sr.get("difficulty", None)
+        static_eff = sr.get("static_eff", {})
+        dyn_eff = sr.get("dynamic_eff", {})
 
+        lines.append(f"[Stage {stage} | dataset = {ds}]")
+        if diff is not None:
+            lines.append(f"- graph_difficulty ≈ {diff:.2f}")
+
+        # 성능
         if zero_rmse is None:
-            # pretrain / first stage
+            # pretrain / 첫 스테이지
             if test_rmse is not None:
                 lines.append(
-                    f"- Stage {stage} (dataset={ds}): "
-                    f"RMSE on test set after training = {test_rmse:.4f}."
+                    f"- test_RMSE (after training on this dataset) ≈ {test_rmse:.4f}"
                 )
         else:
-            # transfer stage
             lines.append(
-                f"- Stage {stage} (dataset={ds}): "
-                f"zero-shot RMSE on test = {zero_rmse:.4f}, "
-                f"fine-tuned RMSE on test = {test_rmse:.4f}."
+                f"- zero_shot_test_RMSE ≈ {zero_rmse:.4f}, "
+                f"fine_tuned_test_RMSE ≈ {test_rmse:.4f}"
             )
 
-    # domain transfer 요약도 있으면 추가
+        # 효율성
+        total_params = static_eff.get("total_params")
+        trainable_params = static_eff.get("trainable_params")
+        flops = sr.get("flops", {}).get("flops", None)
+        peak_mem_mb = dyn_eff.get("peak_mem_mb", None)
+        train_time_sec = dyn_eff.get("train_time_sec", None)
+
+        if total_params is not None and trainable_params is not None:
+            lines.append(
+                f"- params: total={total_params} trainable={trainable_params}"
+            )
+        if flops is not None:
+            lines.append(f"- flops (per forward pass, approx) ≈ {flops:.1f}")
+        if peak_mem_mb is not None:
+            lines.append(f"- peak_train_mem_MB ≈ {peak_mem_mb:.1f}")
+        if train_time_sec is not None:
+            lines.append(f"- train_time_sec ≈ {train_time_sec:.1f}")
+
+        # 예산 곡선
+        curve = sr.get("curve_rmse", [])
+        if curve:
+            lines.append("- budget_vs_rmse_curve:")
+            lines.append(format_budget_curve(curve))
+
+        lines.append("")  # 빈 줄로 stage 구분
+
+    # -------- domain transfer summary (있으면) --------
     if rag_summary is not None:
-        lines.append("\nDomain-transfer view (source -> target):")
+        lines.append("### DOMAIN TRANSFER VIEW\n")
         lines.append(
-            f"- Source dataset: {rag_summary['source_dataset']} "
+            f"- source_dataset: {rag_summary['source_dataset']} "
             f"(stage {rag_summary['source_stage']})"
         )
         lines.append(
-            f"- Target dataset: {rag_summary['target_dataset']} "
+            f"- target_dataset: {rag_summary['target_dataset']} "
             f"(stage {rag_summary['target_stage']})"
         )
         lines.append(
-            f"- Zero-shot RMSE = {rag_summary['rag_zero_rmse']:.4f}, "
-            f"fine-tuned RMSE = {rag_summary['rag_ft_rmse']:.4f} "
-            f"(absolute gain = {rag_summary['rag_gain_abs']:.4f}, "
-            f"relative gain = {rag_summary['rag_gain_rel']*100:.2f}% )."
+            f"- zero_shot_test_RMSE on target ≈ {rag_summary['rag_zero_rmse']:.4f}"
         )
+        lines.append(
+            f"- fine_tuned_test_RMSE on target ≈ {rag_summary['rag_ft_rmse']:.4f}"
+        )
+        lines.append(
+            f"- absolute_gain ≈ {rag_summary['rag_gain_abs']:.4f}, "
+            f"relative_gain ≈ {rag_summary['rag_gain_rel']*100:.2f}%"
+        )
+        lines.append("")
 
+    # -------- [QUESTIONS] 섹션: LLM에게 분석 질의 던지기 --------
+    lines.append("### QUESTIONS\n")
+    lines.append("Q1. Which city dataset appears to be more difficult to model and why?")
+    lines.append("Q2. How well does the model transfer from the source city to the target city?")
     lines.append(
-        "\nBased on these metrics, write a short English commentary (2-3 sentences) "
-        "describing how well the model predicts traffic, how performance transfers "
-        "from the source city to the target city, and any trade-offs between "
-        "performance and efficiency you can infer. Do not repeat the numbers verbatim; "
-        "summarize them in natural language."
+        "Q3. How does performance improve as we increase the fine-tuning budget fractions "
+        "on the target dataset? Does it saturate quickly or slowly?"
     )
+    lines.append(
+        "Q4. Considering the parameter count, FLOPs, and training time, how would you "
+        "describe the efficiency of this graph model?"
+    )
+    lines.append(
+        "Q5. Summarize the overall story of these experiments in 2–3 English sentences, "
+        "as if you are broadcasting a short traffic forecasting commentary."
+    )
+    lines.append("")
+    lines.append("### Answer\n")
 
     return "\n".join(lines)
 
@@ -136,7 +199,7 @@ def generate_rag_commentary(all_stage_results, llm_name: str, device: str):
     """
     기존 그래프 모델(BigST 등)이 예측한 결과(all_stage_results)를
     'retrieved structured context'로 보고,
-    Gemma 같은 LLM이 영어로 교통 예측 중계를 해주는 RAG-style 레이어.
+    Gemma 같은 LLM이 영어로 Q&A 스타일 해설을 생성하는 RAG-style 레이어.
     """
     rag_summary = compute_rag_summary(all_stage_results)
     prompt = build_rag_prompt(all_stage_results, rag_summary)
@@ -161,17 +224,28 @@ def generate_rag_commentary(all_stage_results, llm_name: str, device: str):
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=256,
+            max_new_tokens=512,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
 
     full_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-    # 프롬프트 부분은 빼고, 뒤쪽 commentary만 대충 추출
-    if full_text.startswith(prompt):
-        commentary = full_text[len(prompt):].strip()
+    # 프롬프트 안에 "### Answer"를 넣어놨으므로,
+    # 그 이후만 떼어 commentary로 사용.
+    answer_marker = "### Answer"
+    commentary = ""
+
+    if answer_marker in full_text:
+        commentary = full_text.split(answer_marker, 1)[1].strip()
     else:
+        # 혹시 marker 못 찾으면 전체 텍스트에서 CONTEXT 앞 부분만 대충 날리고 사용
+        if "### CONTEXT" in full_text:
+            commentary = full_text.split("### CONTEXT", 1)[-1].strip()
+        else:
+            commentary = full_text.strip()
+
+    if not commentary:
         commentary = full_text.strip()
 
     print("\n[RAG Commentary]\n" + commentary + "\n")
