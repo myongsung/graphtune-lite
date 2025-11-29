@@ -194,61 +194,143 @@ def build_rag_prompt(all_stage_results, rag_summary=None):
 
     return "\n".join(lines)
 
-
-def generate_rag_commentary(all_stage_results, llm_name: str, device: str):
+def generate_rag_commentary(all_stage_results, rag_llm: str, device: str = "cuda"):
     """
-    기존 그래프 모델(BigST 등)이 예측한 결과(all_stage_results)를
-    'retrieved structured context'로 보고,
-    Gemma 같은 LLM이 영어로 Q&A 스타일 해설을 생성하는 RAG-style 레이어.
-    """
-    rag_summary = compute_rag_summary(all_stage_results)
-    prompt = build_rag_prompt(all_stage_results, rag_summary)
+    all_stage_results에서 요약 텍스트를 만들어서,
+    rag_llm (예: google/gemma-3-270m-it)로 영어 코멘터리를 생성.
 
-    print(f"\n[RAG] Using LLM `{llm_name}` to generate commentary...")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(llm_name)
-        model = AutoModelForCausalLM.from_pretrained(
-            llm_name,
-            torch_dtype=torch.float16 if (device == "cuda" and torch.cuda.is_available()) else torch.float32,
-        )
-    except Exception as e:
-        print(f"[RAG] Failed to load LLM `{llm_name}`: {e}")
+    반환값: str (LLM이 생성한 commentary) 또는 None
+    """
+    if rag_llm is None:
         return None
 
-    model.to(device)
-    model.eval()
+    from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    inputs = tokenizer(prompt, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    # ---------- 1) 컨텍스트 텍스트 구성 ----------
+    if len(all_stage_results) == 0:
+        return None
 
+    lines = []
+    for sr in all_stage_results:
+        stage = sr["stage"]
+        ds = sr["dataset"]
+        diff = sr.get("difficulty", None)
+        st = sr["static_eff"]
+        dy = sr["dynamic_eff"]
+        curve = sr.get("curve_rmse", [])
+
+        lines.append(f"[Stage {stage} | dataset = {ds}]")
+        if diff is not None:
+            lines.append(f"- graph_difficulty ≈ {diff:.2f}")
+        if sr.get("zero_rmse") is not None:
+            lines.append(f"- zero_shot_test_RMSE ≈ {sr['zero_rmse']:.4f}")
+        lines.append(f"- test_RMSE (after training) ≈ {sr['test_rmse']:.4f}")
+        lines.append(
+            f"- params: total={st.get('total_params', 0)} "
+            f"trainable={st.get('trainable_params', 0)}"
+        )
+        if "flops" in sr and sr["flops"].get("flops") is not None:
+            lines.append(
+                f"- flops (per forward pass, approx) ≈ {sr['flops']['flops']:.1f}"
+            )
+        lines.append(
+            f"- peak_train_mem_MB ≈ {dy.get('peak_mem_mb', 0.0):.1f}\n"
+            f"- train_time_sec ≈ {dy.get('train_time_sec', 0.0):.1f}"
+        )
+        if curve:
+            lines.append("- budget_vs_rmse_curve:")
+            for frac, rmse in curve:
+                lines.append(f"  - budget_fraction = {frac:.2f} → test_RMSE = {rmse:.4f}")
+        lines.append("")  # blank line
+
+    context_block = "\n".join(lines).strip()
+
+    # 도메인 전이 관점 (stage 0 -> stage 1 가정)
+    domain_block = ""
+    if len(all_stage_results) >= 2:
+        src = all_stage_results[0]
+        tgt = all_stage_results[1]
+        zero_rmse = tgt.get("zero_rmse", None)
+        ft_rmse = tgt.get("test_rmse", None)
+        if zero_rmse is not None and ft_rmse is not None:
+            gain_abs = float(zero_rmse) - float(ft_rmse)
+            gain_rel = gain_abs / float(zero_rmse) if zero_rmse > 0 else 0.0
+            domain_block = (
+                "### DOMAIN TRANSFER VIEW\n\n"
+                f"- source_dataset: {src['dataset']} (stage {src['stage']})\n"
+                f"- target_dataset: {tgt['dataset']} (stage {tgt['stage']})\n"
+                f"- zero_shot_test_RMSE on target ≈ {zero_rmse:.4f}\n"
+                f"- fine_tuned_test_RMSE on target ≈ {ft_rmse:.4f}\n"
+                f"- absolute_gain ≈ {gain_abs:.4f}, "
+                f"relative_gain ≈ {gain_rel * 100:.2f}%\n"
+            )
+
+    questions_block = """
+### QUESTIONS
+
+Q1. Which city dataset appears to be more difficult to model and why?
+Q2. How well does the model transfer from the source city to the target city?
+Q3. How does performance improve as we increase the fine-tuning budget fractions on the target dataset? Does it saturate quickly or slowly?
+Q4. Considering the parameter count, FLOPs, and training time, how would you describe the efficiency of this graph model?
+Q5. Summarize the overall story of these experiments in 2–3 English sentences, as if you are broadcasting a short traffic forecasting commentary.
+
+Please answer in English.
+""".strip()
+
+    user_content = (
+        "You are an expert traffic forecasting analyst.\n"
+        "You will see evaluation results of a graph-based traffic prediction model\n"
+        "across multiple city datasets, along with budgeted fine-tuning curves.\n\n"
+        "### CONTEXT\n\n"
+        + context_block
+        + "\n\n"
+        + domain_block
+        + "\n\n"
+        + questions_block
+    )
+
+    # ---------- 2) LLM 로딩 ----------
+    tokenizer = AutoTokenizer.from_pretrained(rag_llm)
+    model = AutoModelForCausalLM.from_pretrained(
+        rag_llm,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto",
+    )
+
+    # ---------- 3) chat 템플릿 or plain 프롬프트 ----------
+    if "gemma-3-270m-it" in rag_llm and hasattr(tokenizer, "apply_chat_template"):
+        messages = [
+            {"role": "system", "content": "You are a helpful expert traffic forecasting analyst."},
+            {"role": "user", "content": user_content},
+        ]
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    else:
+        # base 모델일 때는 그냥 텍스트 프롬프트
+        prompt_text = user_content + "\n\n### Answer\n"
+
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+
+    # ---------- 4) 생성 & '입력 이후 토큰만' 잘라내기 ----------
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=512,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
+            max_new_tokens=256,
+            do_sample=True,
+            temperature=0.8,
+            top_p=0.9,
         )
 
-    full_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    # output_ids: [1, input_len + new_len]
+    input_len = inputs["input_ids"].shape[1]
+    gen_ids = output_ids[0, input_len:]  # → 새로 생성된 부분만
+    commentary = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
-    # 프롬프트 안에 "### Answer"를 넣어놨으므로,
-    # 그 이후만 떼어 commentary로 사용.
-    answer_marker = "### Answer"
-    commentary = ""
+    if commentary == "":
+        # 진짜로 한 글자도 안 쓴 경우 디버그용
+        commentary = "[WARN] LLM generated empty commentary."
 
-    if answer_marker in full_text:
-        commentary = full_text.split(answer_marker, 1)[1].strip()
-    else:
-        # 혹시 marker 못 찾으면 전체 텍스트에서 CONTEXT 앞 부분만 대충 날리고 사용
-        if "### CONTEXT" in full_text:
-            commentary = full_text.split("### CONTEXT", 1)[-1].strip()
-        else:
-            commentary = full_text.strip()
-
-    if not commentary:
-        commentary = full_text.strip()
-
-    print("\n[RAG Commentary]\n" + commentary + "\n")
     return commentary
 
 
