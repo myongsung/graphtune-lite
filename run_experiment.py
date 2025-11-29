@@ -647,9 +647,11 @@ def main():
     # ----- RAG-style 영어 중계 (rag_llm 지정된 경우에만) -----
     rag_commentary = None
     if args.rag_llm is not None:
+        # 함수 정의가 (all_stage_results, rag_llm, device=...) 이기 때문에
+        # 키워드 이름을 rag_llm로 맞추거나, 그냥 위치 인자로 넘겨준다.
         rag_commentary = generate_rag_commentary(
             all_stage_results,
-            llm_name=args.rag_llm,
+            rag_llm=args.rag_llm,
             device=device,
         )
         # JSON에서 쉽게 보이도록 모든 stage에 동일 commentary 추가
