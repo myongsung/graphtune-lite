@@ -1,6 +1,7 @@
 import pickle
 import numpy as np
 import pandas as pd
+from typing import Optional  # ← 추가
 
 def _infer_loc_columns(loc_df: pd.DataFrame):
     norm_map = {str(c).lower().strip(): c for c in loc_df.columns}
