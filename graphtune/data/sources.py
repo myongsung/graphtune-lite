@@ -32,7 +32,17 @@ DATA_SOURCES = {
             "graph_sensor_locations_bay.csv":
                 "https://raw.githubusercontent.com/liyaguang/DCRNN/master/data/sensor_graph/graph_sensor_locations_bay.csv",
         }
-    }
+    },
+       "songdo": {
+        "hf_repo": None,  # 로컬 파일만 사용
+        "files": {
+            "h5": "songdo_full.h5",
+            "adj": "adj_songdo_rulebased.pkl",
+            # 실제 좌표는 없으니, 더미(loc) 파일 이름만 미리 지정
+            "loc": "songdo_dummy_loc.csv",
+        },
+        "urls": {},  # url/hf_hub로 받지 않고 항상 local만 쓸 것
+    },
 }
 
 def resolve_dataset_key(dataset_name: str) -> str:
@@ -41,6 +51,8 @@ def resolve_dataset_key(dataset_name: str) -> str:
         return "metr-la"
     if name in ["pems-bay", "bay", "pems"]:
         return "pems-bay"
+    if name in ["songdo", "songdo-full", "sd"]:
+        return "songdo"
     raise ValueError(f"Unknown dataset_name: {dataset_name}")
 
 def _download_url(url: str, dst_path: str) -> str:
@@ -58,12 +70,22 @@ def ensure_local_file(
     cache_dir: Optional[str] = None,
     url_override: Optional[str] = None,
     revision: Optional[str] = None,
-) -> str:
+) -> Optional[str]:   # 🔥 반환 타입을 Optional[str] 로 변경
     """
     legacy _ensure_local_file 그대로.
+    loc 파일이 정의되어 있지 않은 데이터셋(예: songdo)도 지원.
     """
     ds = DATA_SOURCES[dataset_key]
-    filename = ds["files"][kind]
+
+    # 🔥 새 부분: loc 파일이 아예 없는 경우 처리
+    filename = ds["files"].get(kind)
+    if filename is None:
+        # loc 파일은 없어도 되는 경우가 있으니 None을 허용
+        if kind == "loc":
+            return None
+        # h5/adj 가 None이면 명백히 잘못된 설정이니까 에러
+        raise ValueError(f"{dataset_key} has no file entry for kind={kind}")
+
     local_path = os.path.join(data_dir, filename)
 
     if os.path.exists(local_path) and source in ["auto", "local"]:
