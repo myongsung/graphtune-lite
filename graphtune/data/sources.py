@@ -39,7 +39,7 @@ DATA_SOURCES = {
             "h5": "songdo_full.h5",
             "adj": "adj_songdo_rulebased.pkl",
             # 실제 좌표는 없으니, 더미(loc) 파일 이름만 미리 지정
-            "loc": "songdo_dummy_loc.csv",
+            "loc": None,   # ✅ 좌표 파일 없음
         },
         "urls": {},  # url/hf_hub로 받지 않고 항상 local만 쓸 것
     },
@@ -70,20 +70,19 @@ def ensure_local_file(
     cache_dir: Optional[str] = None,
     url_override: Optional[str] = None,
     revision: Optional[str] = None,
-) -> Optional[str]:   # 🔥 반환 타입을 Optional[str] 로 변경
+) -> Optional[str]:   # 🔥 Optional[str]
     """
-    legacy _ensure_local_file 그대로.
-    loc 파일이 정의되어 있지 않은 데이터셋(예: songdo)도 지원.
+    legacy _ensure_local_file 그대로, 단 loc 파일이 없는 경우를 허용.
     """
     ds = DATA_SOURCES[dataset_key]
 
-    # 🔥 새 부분: loc 파일이 아예 없는 경우 처리
+    # 🔥 여기 추가: 파일 이름이 None이면 loc는 optional로 처리
     filename = ds["files"].get(kind)
     if filename is None:
-        # loc 파일은 없어도 되는 경우가 있으니 None을 허용
         if kind == "loc":
+            # Songdo처럼 loc가 아예 없는 데이터셋
             return None
-        # h5/adj 가 None이면 명백히 잘못된 설정이니까 에러
+        # h5/adj가 None이면 진짜 설정 문제
         raise ValueError(f"{dataset_key} has no file entry for kind={kind}")
 
     local_path = os.path.join(data_dir, filename)
