@@ -94,17 +94,26 @@ def retrieve_docs(
 # 예측 엔진 (BigST) - GraphTune 기반
 # -------------------------------------------------------------------------
 
-
 def _prepare_bigst_input(x: torch.Tensor) -> torch.Tensor:
     """
-    Ensure input shape for BigST is (B, N, T, D) with D >= 2.
+    Ensure input shape for BigST is (B, N, T, D) with D >= 3.
 
-    - If x is (B, T, N)           -> build (B, N, T, 2):
-        * channel 0: original value
-        * channel 1: simple time index in [0, 1]
-    - If x is (B, T, N, D)        -> permute to (B, N, T, D), and if D == 1,
-                                     append a time index channel.
-    - If x is already (B, N, T, D)-> if D == 1, append time index channel.
+    BigST forward expects at least three feature channels:
+      - channel 0: main value (e.g., traffic volume)
+      - channel 1: time-of-day like index
+      - channel 2: week/day-of-week like index
+
+    Here we synthesize simple time/weekday features for demo purposes.
+
+    Cases:
+    - If x is (B, T, N):
+        -> (B, N, T, 3)
+           * ch0: original value
+           * ch1: linear time index in [0, 1]
+           * ch2: zeros (dummy week index)
+    - If x is (B, T, N, D) or (B, N, T, D):
+        -> permute to (B, N, T, D) if needed
+        -> if D < 3, append synthetic time/weekday channels.
     """
     if x.dim() == 3:
         # x: (B, T, N)
@@ -112,11 +121,14 @@ def _prepare_bigst_input(x: torch.Tensor) -> torch.Tensor:
         # value channel: (B, N, T, 1)
         val = x.permute(0, 2, 1).unsqueeze(-1)  # (B, N, T, 1)
 
-        # simple time index in [0, 1], shared across batch & nodes
+        # time-of-day like index in [0, 1], same for all batch/nodes
         time_idx = torch.linspace(0.0, 1.0, steps=T, device=x.device)  # (T,)
         time_idx = time_idx.view(1, 1, T, 1).expand(B, N, T, 1)        # (B, N, T, 1)
 
-        x4 = torch.cat([val, time_idx], dim=-1)  # (B, N, T, 2)
+        # dummy week/day-of-week index (all zeros)
+        week_idx = torch.zeros(1, 1, T, 1, device=x.device).expand(B, N, T, 1)  # (B, N, T, 1)
+
+        x4 = torch.cat([val, time_idx, week_idx], dim=-1)  # (B, N, T, 3)
         return x4
 
     elif x.dim() == 4:
@@ -124,23 +136,42 @@ def _prepare_bigst_input(x: torch.Tensor) -> torch.Tensor:
         B, d1, d2, D = x.size()
         x4 = x
 
-        # Heuristic: if second dim looks like time (smaller than spatial dim),
-        # we assume (B, T, N, D) and permute to (B, N, T, D).
+        # Heuristic: if first spatial-like dim seems to be time (smaller),
+        # treat as (B, T, N, D) and permute to (B, N, T, D).
         if d1 < d2:
             x4 = x4.permute(0, 2, 1, 3)  # (B, N, T, D)
 
-        # Ensure we have at least 2 feature channels
-        if x4.size(-1) == 1:
-            B, N, T, _ = x4.size()
+        B, N, T, D = x4.size()
+
+        # If D >= 3, just return as is.
+        if D >= 3:
+            return x4
+
+        # Need to append extra channels to reach D=3.
+        # We'll keep existing channels as-is, and add:
+        # - time_idx if not already present
+        # - week_idx if still missing
+        extras = []
+
+        if D == 1:
+            # only value -> add time_idx and week_idx
             time_idx = torch.linspace(0.0, 1.0, steps=T, device=x4.device)
             time_idx = time_idx.view(1, 1, T, 1).expand(B, N, T, 1)
-            x4 = torch.cat([x4, time_idx], dim=-1)  # (B, N, T, 2)
+            week_idx = torch.zeros(1, 1, T, 1, device=x4.device).expand(B, N, T, 1)
+            extras = [time_idx, week_idx]
+
+        elif D == 2:
+            # assume channels: [value, time_idx] -> add week_idx
+            week_idx = torch.zeros(1, 1, T, 1, device=x4.device).expand(B, N, T, 1)
+            extras = [week_idx]
+
+        if extras:
+            x4 = torch.cat([x4] + extras, dim=-1)  # (B, N, T, 3)
 
         return x4
 
     else:
         raise ValueError(f"Unexpected input dimension for BigST: x.dim()={x.dim()}")
-
 
 def _project_bigst_output(y_hat: torch.Tensor) -> torch.Tensor:
     """
