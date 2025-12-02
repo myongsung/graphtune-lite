@@ -97,24 +97,49 @@ def retrieve_docs(
 
 def _prepare_bigst_input(x: torch.Tensor) -> torch.Tensor:
     """
-    Ensure input shape for BigST is (B, N, T, D).
+    Ensure input shape for BigST is (B, N, T, D) with D >= 2.
 
-    - If x is (B, T, N) -> permute to (B, N, T) and add feature dim -> (B, N, T, 1)
-    - If x is (B, T, N, D) -> permute to (B, N, T, D)
-    - If x is already (B, N, T, D) -> return as is
+    - If x is (B, T, N)           -> build (B, N, T, 2):
+        * channel 0: original value
+        * channel 1: simple time index in [0, 1]
+    - If x is (B, T, N, D)        -> permute to (B, N, T, D), and if D == 1,
+                                     append a time index channel.
+    - If x is already (B, N, T, D)-> if D == 1, append time index channel.
     """
     if x.dim() == 3:
-        # (B, T, N) -> (B, N, T, 1)
-        x = x.permute(0, 2, 1).unsqueeze(-1)
+        # x: (B, T, N)
+        B, T, N = x.size()
+        # value channel: (B, N, T, 1)
+        val = x.permute(0, 2, 1).unsqueeze(-1)  # (B, N, T, 1)
+
+        # simple time index in [0, 1], shared across batch & nodes
+        time_idx = torch.linspace(0.0, 1.0, steps=T, device=x.device)  # (T,)
+        time_idx = time_idx.view(1, 1, T, 1).expand(B, N, T, 1)        # (B, N, T, 1)
+
+        x4 = torch.cat([val, time_idx], dim=-1)  # (B, N, T, 2)
+        return x4
+
     elif x.dim() == 4:
+        # x: (B, T, N, D) or (B, N, T, D)
         B, d1, d2, D = x.size()
-        # Heuristic: if first spatial dim seems like time, swap
-        # Most loaders here give (B, T, N, D), so we permute to (B, N, T, D)
-        # If it was already (B, N, T, D), this permute changes nothing important
-        # as long as d1==d2 we could be ambiguous, but in practice T != N.
-        if d1 < d2:  # typically T < N
-            x = x.permute(0, 2, 1, 3)  # (B, N, T, D)
-    return x
+        x4 = x
+
+        # Heuristic: if second dim looks like time (smaller than spatial dim),
+        # we assume (B, T, N, D) and permute to (B, N, T, D).
+        if d1 < d2:
+            x4 = x4.permute(0, 2, 1, 3)  # (B, N, T, D)
+
+        # Ensure we have at least 2 feature channels
+        if x4.size(-1) == 1:
+            B, N, T, _ = x4.size()
+            time_idx = torch.linspace(0.0, 1.0, steps=T, device=x4.device)
+            time_idx = time_idx.view(1, 1, T, 1).expand(B, N, T, 1)
+            x4 = torch.cat([x4, time_idx], dim=-1)  # (B, N, T, 2)
+
+        return x4
+
+    else:
+        raise ValueError(f"Unexpected input dimension for BigST: x.dim()={x.dim()}")
 
 
 def _project_bigst_output(y_hat: torch.Tensor) -> torch.Tensor:
