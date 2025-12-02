@@ -95,6 +95,45 @@ def retrieve_docs(
 # -------------------------------------------------------------------------
 
 
+def _prepare_bigst_input(x: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure input shape for BigST is (B, N, T, D).
+
+    - If x is (B, T, N) -> permute to (B, N, T) and add feature dim -> (B, N, T, 1)
+    - If x is (B, T, N, D) -> permute to (B, N, T, D)
+    - If x is already (B, N, T, D) -> return as is
+    """
+    if x.dim() == 3:
+        # (B, T, N) -> (B, N, T, 1)
+        x = x.permute(0, 2, 1).unsqueeze(-1)
+    elif x.dim() == 4:
+        B, d1, d2, D = x.size()
+        # Heuristic: if first spatial dim seems like time, swap
+        # Most loaders here give (B, T, N, D), so we permute to (B, N, T, D)
+        # If it was already (B, N, T, D), this permute changes nothing important
+        # as long as d1==d2 we could be ambiguous, but in practice T != N.
+        if d1 < d2:  # typically T < N
+            x = x.permute(0, 2, 1, 3)  # (B, N, T, D)
+    return x
+
+
+def _project_bigst_output(y_hat: torch.Tensor) -> torch.Tensor:
+    """
+    Project BigST output to (B, T_out, N) so it matches y.
+
+    - If (B, N, T_out, D) -> squeeze D, then permute to (B, T_out, N)
+    - If (B, N, T_out)     -> permute to (B, T_out, N)
+    """
+    if y_hat.dim() == 4:
+        # (B, N, T_out, D)
+        if y_hat.size(-1) == 1:
+            y_hat = y_hat.squeeze(-1)
+    if y_hat.dim() == 3:
+        # (B, N, T_out) -> (B, T_out, N)
+        y_hat = y_hat.permute(0, 2, 1)
+    return y_hat
+
+
 def train_bigst_for_bundle(
     bundle: Dict[str, Any],
     num_epochs: int = 3,
@@ -102,8 +141,10 @@ def train_bigst_for_bundle(
     device: Optional[str] = None,
 ):
     """
-    GraphTune의 BigST 모델을 사용해 각 도시용 예측 모델을 간단히 학습.
-    (full train이 아니라 데모용으로 몇 epoch만)
+    Simple custom training loop for BigST using the GraphTune dataloaders.
+
+    - Uses masked MAE over y (B, T_out, N).
+    - Only for demo: we don't track val metrics here.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -115,26 +156,55 @@ def train_bigst_for_bundle(
     ).to(device)
 
     train_loader = bundle["train_loader"]
-    val_loader = bundle["val_loader"]
     scaler = bundle["scaler"]
 
-    print(f"[BigST] Training for dataset={bundle.get('dataset_name', 'unknown')} "
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    print(f"[BigST] Simple training for dataset={bundle.get('dataset_name', 'unknown')} "
           f"(epochs={num_epochs}, lr={lr})")
 
-    # GraphTune의 train_one_stage 사용
-    model, stats = train_one_stage(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        scaler=scaler,
-        num_epochs=num_epochs,
-        lr=lr,
-        device=device,
-        is_dcrnn=False,
-        profile=False,
-    )
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0.0
+        steps = 0
 
-    print(f"[BigST] Done. stats={stats}")
+        for batch in train_loader:
+            if isinstance(batch, (list, tuple)) and len(batch) >= 3:
+                x, y, mask = batch
+            else:
+                # Fallback: assume (x, y)
+                x, y = batch
+                mask = torch.ones_like(y)
+
+            x = x.to(device)          # (B, T_in, N) or (B, T_in, N, D)
+            y = y.to(device)          # (B, T_out, N)
+            mask = mask.to(device)    # same shape as y or y with extra dim
+
+            x_in = _prepare_bigst_input(x)   # -> (B, N, T_in, D)
+            y_hat = model(x_in)              # BigST output
+
+            y_hat = _project_bigst_output(y_hat)  # -> (B, T_out, N)
+
+            # Align mask shape
+            if mask.dim() > y_hat.dim():
+                # e.g., (B, T_out, N, 1) -> (B, T_out, N)
+                mask = mask.squeeze(-1)
+            mask = (mask > 0).float()
+
+            diff = (y_hat - y) * mask
+            loss = diff.abs().sum() / (mask.sum() + 1e-6)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            steps += 1
+
+        avg_loss = total_loss / max(steps, 1)
+        print(f"[BigST] epoch {epoch+1}/{num_epochs} train_masked_MAE={avg_loss:.4f}")
+
+    print("[BigST] Training finished (demo).")
     return model
 
 
@@ -165,13 +235,22 @@ def simple_forecast_node(
         if last_batch is None:
             return "No test data is available, so the forecast cannot be computed."
 
-        x, y, mask = last_batch  # (B, T_in, N)
-        x = x.to(device)
-        y_hat = model(x)  # (B, T_out, N)
+        if isinstance(last_batch, (list, tuple)) and len(last_batch) >= 3:
+            x, y, mask = last_batch
+        else:
+            x, y = last_batch
+            mask = torch.ones_like(y)
+
+        x = x.to(device)  # (B, T_in, N) or (B, T_in, N, D)
+        x_in = _prepare_bigst_input(x)  # -> (B, N, T_in, D)
+        y_hat = model(x_in)             # BigST output
 
     # Use only the last sample in the last batch
-    x_last = x[-1:]         # (1, T_in, N)
-    y_hat_last = y_hat[-1:] # (1, T_out, N)
+    x_last = x[-1:]         # (1, T_in, N)  (original, for history)
+    y_hat_last = y_hat[-1:] # e.g., (1, N, T_out, D?) or (1, N, T_out)
+
+    # Project model output to (B, T_out, N)
+    y_hat_last = _project_bigst_output(y_hat_last)  # -> (1, T_out, N)
 
     # Inverse scaling (scaler expects (..., N))
     x_np = x_last.detach().cpu().numpy().reshape(-1, x_last.shape[-1])
@@ -196,7 +275,6 @@ def simple_forecast_node(
         f"and a maximum of about {fut_max:.1f} units of traffic volume."
     )
     return summary
-
 
 # -------------------------------------------------------------------------
 # LLM (microsoft/phi-1_5) 로더 & RAG 답변 생성
