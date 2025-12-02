@@ -3,15 +3,21 @@
 """
 rag_run_experiment.py
 
-멀티시티 교통 데이터(METR-LA, PeMS-BAY, Songdo)를 활용해서
+End-to-end demo of a multi-city traffic RAG system:
 
-- GraphTune 데이터 파이프라인으로 bundle 로딩
-- TrafficDoc로 각 노드의 과거 교통 패턴을 텍스트 문서로 변환
-- TF-IDF 기반 간단한 retriever로 RAG 컨텍스트 구성
-- bundle의 (x, y)에서 '미래 구간 y'를 사용한 naive forecast 요약 생성
-- HuggingFace microsoft/phi-1_5로 자연어 답변 생성
+- Load traffic datasets (METR-LA, PEMS-BAY, Songdo) via GraphTune-lite.
+- Build per-node TrafficDoc summaries (history-based text docs).
+- Build a TF-IDF retriever over all TrafficDocs.
+- Load trained BigST models from checkpoints (produced by run_experiment.py).
+- For a user query about a target city, retrieve relevant docs,
+  run BigST to obtain model-based forecasts for the most relevant sensor,
+  and feed all of this as context to a small LLM (microsoft/phi-1_5).
+- The LLM answers in English.
 
-까지 한 번에 실행하는 간단 데모.
+Assumptions:
+- You have already run `run_experiment.py` with model=bigst and datasets
+  including metr-la, pems-bay, songdo, so that checkpoints like
+  `checkpoints/bigst_metr-la_stage0.pt` are available.
 """
 
 import argparse
@@ -27,12 +33,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # GraphTune-lite imports
-from graphtune import prepare_dataset
+from graphtune import prepare_dataset, build_model
+from graphtune.config import DEFAULT_MODEL_KWARGS
 from graphtune.rag.traffic_docs import TrafficDoc, build_node_level_docs_from_bundle
 
 
 # -------------------------------------------------------------------------
-# TF-IDF 기반 RAG retriever
+# TF-IDF based RAG retriever
 # -------------------------------------------------------------------------
 
 
@@ -57,8 +64,8 @@ def retrieve_docs(
     city: Optional[str] = None,
 ) -> List[Tuple[TrafficDoc, float]]:
     """
-    간단한 TF-IDF 기반 top-k retrieval.
-    city가 지정되면 해당 도시 문서만 대상으로 검색.
+    Simple TF-IDF top-k retrieval.
+    If `city` is given, restrict to docs from that city.
     """
     docs = retriever.docs
     vectorizer = retriever.vectorizer
@@ -86,98 +93,257 @@ def retrieve_docs(
 
 
 # -------------------------------------------------------------------------
-# Naive forecast summary (데이터의 (x, y)를 직접 사용)
+# BigST checkpoint loading + model-based forecast summary
 # -------------------------------------------------------------------------
 
 
-def build_naive_forecast_summary(
-    bundle: Dict[str, Any],
+def _find_latest_bigst_checkpoint(
     city: str,
-    node_index: Optional[int] = None,
+    ckpt_dir: str = "checkpoints",
+    prefix_model_name: str = "bigst",
+) -> str:
+    """
+    Find the latest checkpoint file for BigST trained on a given city.
+    Expected filename pattern: {model_name}_{city}_stage{stage_idx}.pt
+    e.g. bigst_metr-la_stage0.pt, bigst_pems-bay_stage1.pt, ...
+    """
+    if not os.path.isdir(ckpt_dir):
+        raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_dir}")
+
+    prefix = f"{prefix_model_name}_{city}_stage"
+    candidates: List[Tuple[int, str]] = []
+
+    for fname in os.listdir(ckpt_dir):
+        if not (fname.startswith(prefix) and fname.endswith(".pt")):
+            continue
+        # parse stage index
+        try:
+            middle = fname[len(prefix) :]  # e.g. "0.pt"
+            stage_str = middle.replace(".pt", "").strip("_")
+            stage_idx = int(stage_str)
+            candidates.append((stage_idx, os.path.join(ckpt_dir, fname)))
+        except Exception:
+            continue
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No checkpoint found for city={city} in {ckpt_dir} "
+            f"(looking for prefix '{prefix}*')."
+        )
+
+    # choose the highest stage index
+    candidates.sort(key=lambda x: x[0])
+    _, path = candidates[-1]
+    return path
+
+
+def load_bigst_model_for_city(
+    city: str,
+    data_dir: str = "DATA",
+    ckpt_dir: str = "checkpoints",
+    T_in: int = 12,
+    T_out: int = 12,
+    batch_size: int = 32,
+    device: Optional[str] = None,
+) -> Tuple[torch.nn.Module, Dict[str, Any], str]:
+    """
+    Load a BigST model + dataset bundle (for_bigst=True) for a given city
+    using a checkpoint produced by run_experiment.py.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # BigST-friendly dataset
+    bundle = prepare_dataset(
+        dataset_name=city,
+        data_dir=data_dir,
+        source="local",
+        T_in=T_in,
+        T_out=T_out,
+        batch_size=batch_size,
+        for_bigst=True,
+    )
+    bundle["dataset_name"] = city
+
+    # Build model with the same config as run_experiment
+    model_kwargs = DEFAULT_MODEL_KWARGS["bigst"]
+    model = build_model("bigst", bundle, **model_kwargs).to(device)
+
+    # Load checkpoint
+    ckpt_path = _find_latest_bigst_checkpoint(city, ckpt_dir=ckpt_dir)
+    state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+
+    print(f"[BigST] Loaded checkpoint for city={city} from {ckpt_path}")
+    return model, bundle, device
+
+
+def _extract_node_sequence(
+    t: torch.Tensor,
+    node_index: int,
+    num_nodes: int,
+) -> torch.Tensor:
+    """
+    Extract a 1D time sequence (T,) for the given node_index from the last
+    sample in the batch.
+
+    Handles several possible shapes:
+    - (B, N, T) or (B, T, N)
+    - (B, N, T, D) or (B, T, N, D)
+    """
+    # We will always use the last sample in the batch
+    if t.dim() == 4:
+        # (B, ?, ?, D) with D as feature dim
+        core = t[..., 0] if t.size(-1) > 1 else t.squeeze(-1)  # (B, ?, ?)
+        B, d1, d2 = core.shape
+
+        if d1 == num_nodes:
+            # (B, N, T)
+            seq = core[-1, node_index, :]  # (T,)
+        elif d2 == num_nodes:
+            # (B, T, N)
+            seq = core[-1, :, node_index]  # (T,)
+        else:
+            # fallback: flatten assuming last dim is num_nodes
+            flat = core[-1].reshape(-1, num_nodes)  # (T, N)
+            seq = flat[:, node_index]
+        return seq
+
+    elif t.dim() == 3:
+        # (B, ?, ?)
+        B, d1, d2 = t.shape
+        if d1 == num_nodes:
+            # (B, N, T)
+            seq = t[-1, node_index, :]  # (T,)
+        elif d2 == num_nodes:
+            # (B, T, N)
+            seq = t[-1, :, node_index]  # (T,)
+        else:
+            # fallback
+            flat = t[-1].reshape(-1, num_nodes)
+            seq = flat[:, node_index]
+        return seq
+
+    else:
+        # Unexpected; just flatten last sample
+        return t[-1].view(-1)
+
+
+def build_forecast_summary_with_bigst(
+    bundle: Dict[str, Any],
+    model: torch.nn.Module,
+    city: str,
+    node_index: int = 0,
     horizon: int = 12,
 ) -> str:
     """
-    GraphTune bundle의 test_loader에서 (x, y)를 사용해
-    간단한 '미래 구간' 요약을 만든다.
+    Use the trained BigST model to produce a *model-based* forecast summary
+    for a given city and sensor (node_index).
 
-    - x: 과거 입력 시계열 (B, T_in, N)
-    - y: 미래 타깃 시계열 (B, T_out, N)
-    - scaler: StandardScaler가 있으면 inverse_transform으로 원래 단위 복원
-
-    여기서는:
-      - test_loader의 마지막 배치, 마지막 샘플을 사용
-      - 해당 node_index에 대해:
-          * 과거 T_in 동안의 평균/마지막 값
-          * 향후 horizon 동안의 평균/최대 값
+    Steps:
+    - Take the last batch of the test_loader.
+    - Run model(x) to get y_hat (predicted future).
+    - Extract the time sequence for the selected node.
+    - Inverse-transform using bundle["scaler"] (if available).
+    - Compute simple statistics (mean / last / max) and return as text.
     """
-
     test_loader = bundle["test_loader"]
     scaler = bundle.get("scaler", None)
     num_nodes = bundle.get("num_nodes", None)
 
     if num_nodes is None:
-        # fallback: 첫 배치에서 추론
+        # fallback: infer from first batch
         first_batch = next(iter(test_loader))
         x0 = first_batch[0]
-        num_nodes = x0.shape[-1]
+        num_nodes = x0.shape[-2] if x0.dim() >= 3 else x0.shape[-1]
 
-    if node_index is None:
-        node_index = 0
     if node_index < 0 or node_index >= num_nodes:
         node_index = 0
 
+    # Grab last batch
     last_batch = None
     for batch in test_loader:
         last_batch = batch
+
     if last_batch is None:
-        return f"No test data available for {city}, so a forecast summary cannot be computed."
+        return f"No test data available for {city}, so a model-based forecast cannot be computed."
 
     if isinstance(last_batch, (list, tuple)) and len(last_batch) >= 2:
-        x, y = last_batch[0], last_batch[1]
+        x, _ = last_batch[0], last_batch[1]
     else:
-        return f"Unexpected batch structure for {city}, cannot build forecast summary."
+        x = last_batch[0]
 
-    # x: (B, T_in, N), y: (B, T_out, N) 기준으로 처리
-    x_last = x[-1]  # (T_in, N)
-    y_last = y[-1]  # (T_out, N)
+    device = next(model.parameters()).device
+    x = x.to(device)
 
-    x_np = x_last.detach().cpu().numpy()  # (T_in, N)
-    y_np = y_last.detach().cpu().numpy()  # (T_out, N)
+    # Run model
+    with torch.no_grad():
+        y_hat_raw = model(x)
 
+    if isinstance(y_hat_raw, (tuple, list)):
+        y_hat = y_hat_raw[0]
+    else:
+        y_hat = y_hat_raw
+
+    # Bring tensors to CPU for shape processing & inverse-transform
+    x_cpu = x.detach().cpu()
+    y_hat_cpu = y_hat.detach().cpu()
+
+    # Extract history (from x) and forecast (from y_hat) for this node
+    hist_norm = _extract_node_sequence(x_cpu, node_index, num_nodes)  # (T_in,)
+    fut_norm = _extract_node_sequence(y_hat_cpu, node_index, num_nodes)  # (T_out,)
+
+    # Crop forecast to desired horizon
+    if horizon is not None and fut_norm.numel() > horizon:
+        fut_norm = fut_norm[:horizon]
+
+    hist_np = hist_norm.numpy().reshape(-1)  # (T_in,)
+    fut_np = fut_norm.numpy().reshape(-1)    # (T_out,)
+
+    # Inverse-transform using scaler (if available).
+    # GraphTune scalers are node-wise affine. We can embed our single-node vector
+    # into a (T, num_nodes) matrix, then inverse_transform, then select the column.
     if scaler is not None:
+        T_in = hist_np.shape[0]
+        T_out = fut_np.shape[0]
+
+        hist_mat = np.zeros((T_in, num_nodes), dtype=np.float32)
+        fut_mat = np.zeros((T_out, num_nodes), dtype=np.float32)
+
+        hist_mat[:, node_index] = hist_np
+        fut_mat[:, node_index] = fut_np
+
         try:
-            x_flat = x_np.reshape(-1, x_np.shape[-1])  # (T_in, N)
-            y_flat = y_np.reshape(-1, y_np.shape[-1])  # (T_out, N)
-            x_denorm = scaler.inverse_transform(x_flat).reshape(x_np.shape)
-            y_denorm = scaler.inverse_transform(y_flat).reshape(y_np.shape)
+            hist_denorm = scaler.inverse_transform(hist_mat)[:, node_index]
+            fut_denorm = scaler.inverse_transform(fut_mat)[:, node_index]
         except Exception as e:
-            print(f"[Forecast] scaler.inverse_transform failed ({e}), using normalized scale.")
-            x_denorm, y_denorm = x_np, y_np
+            print(f"[BigST Forecast] scaler.inverse_transform failed: {e}")
+            print("[BigST Forecast] Falling back to normalized scale.")
+            hist_denorm = hist_np
+            fut_denorm = fut_np
     else:
-        x_denorm, y_denorm = x_np, y_np
+        hist_denorm = hist_np
+        fut_denorm = fut_np
 
-    hist = x_denorm[:, node_index]                  # (T_in,)
-    fut = y_denorm[:horizon, node_index]            # (horizon,)
-
-    hist_mean = float(hist.mean())
-    hist_last = float(hist[-1])
-    fut_mean = float(fut.mean())
-    fut_max = float(fut.max())
+    hist_mean = float(hist_denorm.mean())
+    hist_last = float(hist_denorm[-1])
+    fut_mean = float(fut_denorm.mean())
+    fut_max = float(fut_denorm.max())
 
     summary = (
         f"For city {city}, focusing on sensor index {node_index}, "
-        f"the average traffic volume over the recent {len(hist)} input time steps "
-        f"is about {hist_mean:.1f} units, with the last observed value around {hist_last:.1f}. "
-        f"In the following {len(fut)} time steps (forecast horizon), "
-        f"the ground-truth future trajectory in the held-out test set has an average "
-        f"of about {fut_mean:.1f} units, with peaks up to roughly {fut_max:.1f} units. "
-        f"This gives a rough indication of the expected traffic level for that node in the near future."
+        f"the BigST model predicts the next {len(fut_denorm)} time steps of traffic volume. "
+        f"Over the recent input window, the average observed traffic volume is about {hist_mean:.1f} units, "
+        f"with the last observed value around {hist_last:.1f}. "
+        f"According to the model's forecast, the upcoming horizon has an average of about {fut_mean:.1f} "
+        f"and peaks up to roughly {fut_max:.1f} units of traffic volume for this sensor."
     )
     return summary
 
 
 # -------------------------------------------------------------------------
-# (옵션) run_experiment 결과 파일에서 BigST 성능 메타데이터 읽기
+# (Optional) Read BigST performance metrics from run_experiment results.json
 # -------------------------------------------------------------------------
 
 
@@ -186,11 +352,11 @@ def load_bigst_metrics_for_city(
     results_path: str = "results.json",
 ) -> Optional[Dict[str, float]]:
     """
-    run_experiment.py가 저장한 results.json (S_uep 리포트)에서
-    해당 도시 + bigst 모델의 성능 요약을 읽어온다.
+    Read BigST performance metrics for a given city from results.json
+    produced by run_experiment.py.
 
-    - zero_rmse: zero-shot RMSE (transfer 전)
-    - test_rmse: fine-tuning 후 RMSE
+    - zero_rmse: zero-shot RMSE (transfer before fine-tuning)
+    - test_rmse: fine-tuned RMSE on the test set
     """
     if not os.path.exists(results_path):
         return None
@@ -201,14 +367,14 @@ def load_bigst_metrics_for_city(
     except Exception:
         return None
 
-    # results는 stage별 dict 리스트
+    # results is a list of per-stage dicts
     candidates = [
         r for r in results if r.get("dataset") == city and r.get("model") == "bigst"
     ]
     if not candidates:
         return None
 
-    # 마지막 stage 기준으로 선택
+    # pick the last stage for this city
     r = sorted(candidates, key=lambda x: x.get("stage", 0))[-1]
 
     return {
@@ -238,7 +404,7 @@ def build_bigst_metrics_text(city: str, results_path: str = "results.json") -> s
 
 
 # -------------------------------------------------------------------------
-# LLM (microsoft/phi-1_5) 로더 & RAG 답변 생성
+# LLM (microsoft/phi-1_5) loader & RAG answer generation
 # -------------------------------------------------------------------------
 
 
@@ -272,16 +438,20 @@ def build_context_for_query(
     city: str,
     retriever: TfidfRetriever,
     rag_bundles: Dict[str, Dict[str, Any]],
+    bigst_models: Optional[Dict[str, torch.nn.Module]] = None,
+    bigst_bundles: Optional[Dict[str, Dict[str, Any]]] = None,
     k: int = 3,
     horizon: int = 12,
     results_path: str = "results.json",
 ) -> str:
     """
-    - TrafficDoc 기반 RAG: 해당 도시에서 query와 관련있는 노드 문서 top-k 검색
-    - test_loader의 (x, y)를 활용한 naive forecast summary
-    - (있다면) run_experiment 결과에서 BigST 성능 메타데이터 요약
+    Build the RAG context for a given query and city:
+
+    - TrafficDoc-based RAG: retrieve top-k node-level history summaries.
+    - BigST-based forecast summary for the most relevant node (if checkpoint exists).
+    - Optional: BigST benchmark metrics from run_experiment results.json.
     """
-    # 1) 과거 TrafficDoc 기반 RAG
+    # 1) History-based RAG
     retrieved = retrieve_docs(retriever, query, k=k, city=city)
 
     context_parts: List[str] = []
@@ -290,22 +460,36 @@ def build_context_for_query(
         header = f"[Doc from {doc.city}, node_index={doc.node_index}, score={score:.3f}]"
         context_parts.append(header + "\n" + doc.summary_text)
 
-    # 2) naive forecast 요약 (해당 도시 bundle 사용)
-    bundle = rag_bundles[city]
+    # 2) Model-based forecast summary
     if retrieved:
         target_node = retrieved[0][0].node_index
     else:
         target_node = 0
 
-    forecast_text = build_naive_forecast_summary(
-        bundle,
-        city=city,
-        node_index=target_node,
-        horizon=horizon,
-    )
+    forecast_text: str
+    if (
+        bigst_models is not None
+        and bigst_bundles is not None
+        and city in bigst_models
+        and city in bigst_bundles
+    ):
+        forecast_text = build_forecast_summary_with_bigst(
+            bundle=bigst_bundles[city],
+            model=bigst_models[city],
+            city=city,
+            node_index=target_node,
+            horizon=horizon,
+        )
+    else:
+        # Fallback: if BigST checkpoint is missing, do not crash.
+        forecast_text = (
+            f"A model-based forecast summary is not available for city {city} "
+            f"(no BigST checkpoint found)."
+        )
+
     context_parts.append("[Forecast]\n" + forecast_text)
 
-    # 3) (옵션) BigST 벤치마크 성능 텍스트
+    # 3) BigST benchmark metrics (if available)
     bigst_meta = build_bigst_metrics_text(city, results_path=results_path)
     if bigst_meta:
         context_parts.append("[Model performance]\n" + bigst_meta)
@@ -320,6 +504,8 @@ def generate_answer_with_phi(
     rag_state: PhiRAGState,
     retriever: TfidfRetriever,
     rag_bundles: Dict[str, Dict[str, Any]],
+    bigst_models: Optional[Dict[str, torch.nn.Module]] = None,
+    bigst_bundles: Optional[Dict[str, Dict[str, Any]]] = None,
     k: int = 3,
     horizon: int = 12,
     results_path: str = "results.json",
@@ -329,6 +515,8 @@ def generate_answer_with_phi(
         city=city,
         retriever=retriever,
         rag_bundles=rag_bundles,
+        bigst_models=bigst_models,
+        bigst_bundles=bigst_bundles,
         k=k,
         horizon=horizon,
         results_path=results_path,
@@ -336,10 +524,13 @@ def generate_answer_with_phi(
 
     system_prompt = (
         "You are a helpful multi-city traffic assistant. "
-        "You are given traffic history summaries (per sensor) and a naive forecast summary based on held-out data. "
-        "Optionally, you may also see benchmark metrics from a separate GraphTune tuning pipeline. "
-        "Use this information to answer the user's question accurately and concisely. "
-        "Assume that all user questions are in English, and respond in English.\n"
+        "You are given traffic history summaries (per sensor), "
+        "model-based forecasts from a trained BigST graph model, "
+        "and optionally performance metrics from the GraphTune benchmarking pipeline. "
+        "Use only the information in the context to answer the user's question. "
+        "Do NOT invent new place names or districts that are not mentioned in the context. "
+        "If you refer to congestion, be explicit whether a sensor is in the top X% of congestion. "
+        "The user asks questions in English; answer in English.\n"
     )
 
     prompt = (
@@ -372,12 +563,14 @@ def generate_answer_with_phi(
 
 
 # -------------------------------------------------------------------------
-# main: end-to-end 파이프라인
+# main: end-to-end pipeline
 # -------------------------------------------------------------------------
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GraphTune-RAG demo with phi-1_5 (no training inside this script)")
+    parser = argparse.ArgumentParser(
+        description="GraphTune-RAG demo with phi-1_5 and BigST model-based forecasts"
+    )
     parser.add_argument(
         "--cities",
         type=str,
@@ -420,17 +613,23 @@ def main():
         default="results.json",
         help="Path to results.json produced by run_experiment.py (optional, for BigST metrics).",
     )
+    parser.add_argument(
+        "--ckpt_dir",
+        type=str,
+        default="checkpoints",
+        help="Directory where BigST checkpoints (bigst_*_stage*.pt) are stored.",
+    )
     args = parser.parse_args()
 
     city_list = [c.strip() for c in args.cities.split(",") if c.strip()]
     data_dir = args.data_dir
 
-    print("=== GraphTune-RAG demo (phi-1_5) ===")
+    print("=== GraphTune-RAG demo (phi-1_5 + BigST) ===")
     print(f"cities = {city_list}")
     print(f"target city for query = {args.city}")
     print(f"query = {args.query}")
 
-    # 1) 각 도시별 RAG용 데이터셋 준비 + TrafficDoc 생성
+    # 1) RAG datasets + TrafficDocs per city
     rag_bundles: Dict[str, Dict[str, Any]] = {}
     all_docs: List[TrafficDoc] = []
 
@@ -452,27 +651,49 @@ def main():
         print(f"[TrafficDoc] {len(docs)} docs generated for {city}")
         all_docs.extend(docs)
 
-    # 2) TF-IDF 기반 retriever 생성
+    # 2) TF-IDF retriever over all docs
     print("\n[Retriever] Building TF-IDF retriever over all docs...")
     retriever = build_tfidf_retriever(all_docs)
     print("[Retriever] Done.")
 
-    # 3) phi-1_5 로드
+    # 3) BigST models and bundles (for_bigst=True) per city
+    bigst_models: Dict[str, torch.nn.Module] = {}
+    bigst_bundles: Dict[str, Dict[str, Any]] = {}
+
+    for city in city_list:
+        try:
+            m, b, dev = load_bigst_model_for_city(
+                city,
+                data_dir=data_dir,
+                ckpt_dir=args.ckpt_dir,
+                T_in=12,
+                T_out=12,
+                batch_size=32,
+            )
+            bigst_models[city] = m
+            bigst_bundles[city] = b
+        except FileNotFoundError as e:
+            print(f"[BigST] {e}")
+            print(f"[BigST] Forecasts for city={city} will fall back to a placeholder message.")
+
+    # 4) Load phi-1_5
     rag_config = PhiRAGConfig(model_name=args.phi_model)
     rag_state = load_phi_model(rag_config)
 
-    # 4) 단일 질문에 대한 RAG + naive forecast + LLM 파이프라인 실행
+    # 5) Run RAG + BigST forecast + LLM for a single query
     target_city = args.city
     if target_city not in rag_bundles:
         raise ValueError(f"target city {target_city} not in loaded cities {city_list}")
 
-    print("\n=== Running RAG + Forecast (naive) + LLM ===")
+    print("\n=== Running RAG + BigST Forecast + LLM ===")
     answer = generate_answer_with_phi(
         query=args.query,
         city=target_city,
         rag_state=rag_state,
         retriever=retriever,
         rag_bundles=rag_bundles,
+        bigst_models=bigst_models,
+        bigst_bundles=bigst_bundles,
         k=3,
         horizon=args.horizon,
         results_path=args.results_path,
