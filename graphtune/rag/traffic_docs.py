@@ -58,23 +58,11 @@ def _compute_node_stats_from_loader(
     - X(입력 시계열)만 사용 (y는 사용하지 않음)
     - scaler가 주어졌으면 inverse_transform을 적용해 원래 스케일에서 통계를 계산
     - 데이터 전체를 메모리에 올리지 않고, 배치 단위로 누적 계산
-
-    Returns
-    -------
-    stats: dict
-        {
-          "mean": (N,),
-          "std":  (N,),
-          "max":  (N,),
-          "count": int,
-        }
     """
     node_sum = None
     node_sumsq = None
     node_max = None
     total_count = 0
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     for batch_idx, batch in enumerate(loader):
         if max_batches is not None and batch_idx >= max_batches:
@@ -84,56 +72,51 @@ def _compute_node_stats_from_loader(
         if isinstance(batch, (list, tuple)) and len(batch) >= 1:
             x = batch[0]
         else:
-            # 혹시 다른 구조면 그대로 사용
             x = batch
 
-        # (batch, T, N) or (batch, T, N, F)일 수 있음
-        # 여기서는 마지막 차원을 "노드" 기준으로 본다.
-        x = x.to(device)
-
-        # scaler가 있으면 역변환해서 원래 단위로
-        if scaler is not None:
-            try:
-                x = scaler.inverse_transform(x)
-            except Exception:
-                # 혹시 shape이 안 맞으면 그냥 스킵하지 않고 경고만 출력 후 계속 진행
-                print("[traffic_docs] warning: scaler.inverse_transform 실패, 정규화 스케일에서 통계 계산")
-                pass
-
+        # 🔴 여기서부터는 GPU 텐서든 뭐든 일단 CPU numpy로 변환
         x_np = x.detach().cpu().numpy()
 
-        # 마지막 차원을 노드 축으로 보고 나머지를 모두 flatten
-        # 예: (B, T, N) -> (B*T, N)
+        # 🔧 scaler가 있으면 원래 단위로 inverse_transform
+        if scaler is not None:
+            try:
+                # loaders.py에서 norm할 때와 동일하게 마지막 축을 node로 보고 flatten
+                shape = x_np.shape            # (B, T, N)
+                flat = x_np.reshape(-1, shape[-1])   # (B*T, N)
+                flat_inv = scaler.inverse_transform(flat)  # (B*T, N)
+                x_np = flat_inv.reshape(shape)      # 다시 (B, T, N)
+            except Exception as e:
+                # 한 번만 경고 찍고, 이후에는 그냥 정규화 스케일로 진행
+                if batch_idx == 0:
+                    print(f"[traffic_docs] warning: scaler.inverse_transform 실패, 정규화 스케일에서 통계 계산 ({e})")
+
+        # 📊 통계 계산용으로 마지막 축(N)을 노드로 보고 나머지를 모두 펼치기
         if x_np.ndim < 2:
-            # 예외적인 경우: 차원이 너무 작으면 건너뜀
             continue
 
         if x_np.ndim == 2:
-            flat = x_np  # (B, N)
+            flat_stats = x_np   # (B, N)
         else:
-            # (B, T, N) 또는 (B, T, N, F) 가정
-            # 여기서는 F가 없다고 보고 (B, T, N) 기준으로 flatten
-            # F가 있다면, 필요에 따라 평균 등을 먼저 취하는 확장 가능
-            flat = x_np.reshape(-1, x_np.shape[-1])  # (..., N)
+            flat_stats = x_np.reshape(-1, x_np.shape[-1])  # (..., N)
 
         if node_sum is None:
-            N = flat.shape[1]
-            node_sum = flat.sum(axis=0)
-            node_sumsq = (flat ** 2).sum(axis=0)
-            node_max = flat.max(axis=0)
+            N = flat_stats.shape[1]
+            node_sum = flat_stats.sum(axis=0)
+            node_sumsq = (flat_stats ** 2).sum(axis=0)
+            node_max = flat_stats.max(axis=0)
         else:
-            node_sum += flat.sum(axis=0)
-            node_sumsq += (flat ** 2).sum(axis=0)
-            node_max = np.maximum(node_max, flat.max(axis=0))
+            node_sum += flat_stats.sum(axis=0)
+            node_sumsq += (flat_stats ** 2).sum(axis=0)
+            node_max = np.maximum(node_max, flat_stats.max(axis=0))
 
-        total_count += flat.shape[0]
+        total_count += flat_stats.shape[0]
 
     if node_sum is None or total_count == 0:
         raise ValueError("[traffic_docs] loader에서 유효한 데이터를 찾지 못했습니다.")
 
     mean = node_sum / total_count
     var = node_sumsq / total_count - mean ** 2
-    var = np.maximum(var, 1e-6)  # 음수 방지용
+    var = np.maximum(var, 1e-6)
     std = np.sqrt(var)
 
     stats = {
