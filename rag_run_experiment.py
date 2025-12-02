@@ -170,10 +170,39 @@ def load_bigst_model_for_city(
     model = build_model("bigst", bundle, **model_kwargs).to(device)
 
     # Load checkpoint
+    # Load checkpoint
     ckpt_path = _find_latest_bigst_checkpoint(city, ckpt_dir=ckpt_dir)
     state = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(state)
+
+    # Some checkpoints may be saved as {"state_dict": ...}
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+
+    # Filter out keys that do not exist in the current model
+    model_state = model.state_dict()
+    filtered_state = {}
+    unexpected_keys = []
+
+    for k, v in state.items():
+        if k in model_state:
+            filtered_state[k] = v
+        else:
+            unexpected_keys.append(k)
+
+    if unexpected_keys:
+        # Just log a short message; don't spam all keys
+        print(
+            "[BigST] Ignoring unexpected keys in checkpoint "
+            f"(showing up to 10): {unexpected_keys[:10]}"
+        )
+
+    # Load with strict=False so missing buffers do not break
+    model.load_state_dict(filtered_state, strict=False)
     model.eval()
+
+    print(f"[BigST] Loaded checkpoint for city={city} from {ckpt_path}")
+    return model, bundle, device
+
 
     print(f"[BigST] Loaded checkpoint for city={city} from {ckpt_path}")
     return model, bundle, device
