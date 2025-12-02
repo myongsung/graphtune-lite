@@ -212,12 +212,13 @@ def build_node_level_docs_from_bundle(
 
         # 한국어 기준의 간단한 요약 텍스트 (나중에 템플릿/프롬프트로 튜닝 가능)
         summary_lines = [
-            f"{city} 교통 센서 {node_label}의 전체 관측 기간 요약입니다.",
-            f"- 평균 교통량: 약 {node_mean:.1f} 단위",
-            f"- 변동성(표준편차): 약 {node_std:.1f}",
-            f"- 관측된 최대 값: {node_max:.1f}",
-            f"- 다른 노드와 비교했을 때 혼잡도 상위 약 {congestion_percentile:.1f}% 수준에 해당합니다.",
+            f"This is an overall traffic history summary for sensor {node_label} in {city}.",
+            f"- Average traffic volume: about {node_mean:.1f} units.",
+            f"- Volatility (standard deviation): about {node_std:.1f}.",
+            f"- Maximum observed value: {node_max:.1f}.",
+            f"- Compared to other sensors, this node is in approximately the top {congestion_percentile:.1f}% in congestion.",
         ]
+
         summary_text = "\n".join(summary_lines)
 
         doc_id = f"{city}_node_{node_idx}_{time_span_label}"
