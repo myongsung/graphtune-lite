@@ -350,6 +350,12 @@ def main():
         help="Name of the HuggingFace causal LM to use.",
     )
 
+    parser.add_argument(
+    "--query",
+    type=str,
+    default="How heavy will the traffic be around 6 pm in Songdo on a typical weekday?",
+    help="User question in English.",
+    )
 
     parser.add_argument(
         "--city",
