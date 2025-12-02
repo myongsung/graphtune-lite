@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import numpy as np
 import torch
 
@@ -368,6 +369,19 @@ def main():
             "difficulty": float(difficulty),
         }
         all_stage_results.append(stage_result)
+
+        # (옵션) stage별 checkpoint 저장
+        try:
+            ckpt_dir = "checkpoints"
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt_path = os.path.join(
+                ckpt_dir,
+                f"{model_name}_{bundle['dataset_name']}_stage{stage_idx}.pt",
+            )
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"[Saved checkpoint] {ckpt_path}")
+        except Exception as e:
+            print(f"[Warn] Failed to save checkpoint: {e}")
 
         # ----- S_uep 계산 + 리더보드 출력 -----
         suep_summary = compute_suep(
