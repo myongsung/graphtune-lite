@@ -20,6 +20,7 @@ rag_run_experiment.py
 import argparse
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
+from typing import Union, Tuple, List
 
 import numpy as np
 import torch
@@ -173,21 +174,42 @@ def _prepare_bigst_input(x: torch.Tensor) -> torch.Tensor:
     else:
         raise ValueError(f"Unexpected input dimension for BigST: x.dim()={x.dim()}")
 
-def _project_bigst_output(y_hat: torch.Tensor) -> torch.Tensor:
-    """
-    Project BigST output to (B, T_out, N) so it matches y.
 
-    - If (B, N, T_out, D) -> squeeze D, then permute to (B, T_out, N)
-    - If (B, N, T_out)     -> permute to (B, T_out, N)
+def _project_bigst_output(
+    y_hat_raw: Union[torch.Tensor, Tuple, List]
+) -> torch.Tensor:
     """
+    Normalize BigST output to shape (B, T_out, N).
+
+    - BigST sometimes returns a tuple like (y_pred, extra...).
+      We only care about the first element.
+    - We handle:
+        (B, N, T, D)  -> take channel 0, permute to (B, T, N)
+        (B, N, T)     -> permute to (B, T, N)
+    """
+    # 1) unwrap tuple/list
+    if isinstance(y_hat_raw, (tuple, list)):
+        y_hat = y_hat_raw[0]
+    else:
+        y_hat = y_hat_raw
+
+    if not isinstance(y_hat, torch.Tensor):
+        raise TypeError(f"Unexpected BigST output type: {type(y_hat)}")
+
+    # 2) handle feature dim
     if y_hat.dim() == 4:
-        # (B, N, T_out, D)
-        if y_hat.size(-1) == 1:
-            y_hat = y_hat.squeeze(-1)
+        # (B, N, T, D) -> pick the first feature channel as main value
+        B, N, T, D = y_hat.size()
+        if D == 1:
+            y_hat = y_hat.squeeze(-1)        # (B, N, T)
+        else:
+            y_hat = y_hat[..., 0]            # (B, N, T)
+
     if y_hat.dim() == 3:
-        # (B, N, T_out) -> (B, T_out, N)
+        # (B, N, T) -> (B, T, N)
         y_hat = y_hat.permute(0, 2, 1)
-    return y_hat
+
+    return y_hat  # (B, T_out, N)
 
 
 def train_bigst_for_bundle(
@@ -297,16 +319,15 @@ def simple_forecast_node(
             x, y = last_batch
             mask = torch.ones_like(y)
 
-        x = x.to(device)  # (B, T_in, N) or (B, T_in, N, D)
-        x_in = _prepare_bigst_input(x)  # -> (B, N, T_in, D)
-        y_hat = model(x_in)             # BigST output
+        # x: (B, T_in, N) or (B, T_in, N, D)
+        x = x.to(device)
+        x_in = _prepare_bigst_input(x)   # -> (B, N, T_in, D>=3)
+        y_hat_raw = model(x_in)          # may be tensor or tuple
+        y_hat = _project_bigst_output(y_hat_raw)  # -> (B, T_out, N)
 
     # Use only the last sample in the last batch
-    x_last = x[-1:]         # (1, T_in, N)  (original, for history)
-    y_hat_last = y_hat[-1:] # e.g., (1, N, T_out, D?) or (1, N, T_out)
-
-    # Project model output to (B, T_out, N)
-    y_hat_last = _project_bigst_output(y_hat_last)  # -> (1, T_out, N)
+    x_last = x[-1:]         # (1, T_in, N)  in normalized space
+    y_hat_last = y_hat[-1:] # (1, T_out, N)
 
     # Inverse scaling (scaler expects (..., N))
     x_np = x_last.detach().cpu().numpy().reshape(-1, x_last.shape[-1])
