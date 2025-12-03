@@ -112,6 +112,26 @@ def main():
     p.add_argument("--out_json", type=str, default="results.json")
     p.add_argument("--out_csv", type=str, default="results.csv")
 
+    # ----- Info-Budget Coreset (IBCS) -----
+    p.add_argument(
+        "--use_ibcs",
+        action="store_true",
+        help="if set, use InfoBudgetCoresetLayer for few-shot subset selection",
+    )
+    p.add_argument(
+        "--ibcs_budget_mode",
+        type=str,
+        default="node",
+        choices=["sample", "node"],
+        help="기본 버전: sample 단위 코어셋 / node 단위 코어셋 중 선택",
+    )
+    p.add_argument(
+        "--ibcs_budget_frac",
+        type=float,
+        default=1.0,
+        help="difficulty 기반 global budget에 곱해줄 scale factor (0~1)",
+    )
+
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
